@@ -80,7 +80,7 @@ const SETTINGS_MENU = [
     { id: "regex", icon: Database, label: "正则规则", desc: "文本替换", iconColor: BINDING_ACCENTS.regex , glass: "regex" },
     { id: "data", icon: Layers, label: "数据管理", desc: "导入导出", iconColor: BINDING_ACCENTS.api , glass: "data" },
     { id: "binding", icon: Link2, label: "配置绑定", desc: "管理全局默认、角色与应用的配置绑定关系", iconColor: BINDING_ACCENTS.identity , glass: "binding" },
-    { id: "cloud", icon: CloudUpload, label: "云服务部署", desc: "备份 / 微信 / 推送一站配置", iconColor: BINDING_ACCENTS.api , glass: "" },
+    { id: "cloud", icon: CloudUpload, label: "云服务部署", desc: "备份 / 微信 / 推送一站配置", iconColor: BINDING_ACCENTS.api , glass: "data" },
     { id: "weixin", icon: MessageSquare, label: "微信接入", desc: "iLink Bot", iconColor: CONTENT_APP_ACCENTS.chat , glass: "weixin" },
     { id: "toolbox", icon: Wrench, label: "聊天工具箱", desc: "外部工具调用", iconColor: BINDING_ACCENTS.voice , glass: "toolbox" },
     { id: "callOverlay", icon: PhoneCall, label: "通话浮窗外观", desc: "回复条配色", iconColor: BINDING_ACCENTS.voice , glass: "voice" },
@@ -289,6 +289,7 @@ export function PhoneSettingsApp({ onClose, onNotice }: SettingsPageProps) {
         label: cloudItem.label,
         desc: cloudItem.desc,
         iconColor: cloudItem.iconColor,
+        glassIcon: cloudItem.glass,
         onClick: () => setCurrentPage("cloud"),
     };
 

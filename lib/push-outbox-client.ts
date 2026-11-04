@@ -44,6 +44,32 @@ const OUTBOX_BATCH_SIZE = 20;
 const MAX_OUTBOX_BATCHES_PER_PASS = 10;
 const OUTBOX_FOREGROUND_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 
+/**
+ * 离线消息的落库时刻：服务端生成它的时候，而不是「打开 App 拉取它的时候」。
+ *
+ * 过去这里没往 parseAndSaveResponse 传 createdAt，消息一律取「现在」——
+ * 于是杀后台半小时后回来，角色 18:31 说的话会被记成 19:05，聊天记录、历史上下文、
+ * 「距上次回复已过多久」全跟着错。outbox 行自带 created_at（服务端写入时刻），
+ * 直接用它即可。
+ *
+ * 两个边界：
+ *  - 服务端时间不可解析（老数据/缺列）→ 返回 undefined，退回原来的「现在」，不猜。
+ *  - 早于会话里最后一条助手消息（乱序送达、或用户先在别的设备聊过）→ 钳到那条之后
+ *    1 秒。否则消息会插进历史中间，时间线倒流。
+ */
+function resolveOutboxCreatedAt(entryCreatedAt: string | undefined, existing: { role: string; createdAt: string }[]): string | undefined {
+    const parsed = entryCreatedAt ? Date.parse(entryCreatedAt) : NaN;
+    if (!Number.isFinite(parsed)) return undefined;
+    let floorMs = Number.NEGATIVE_INFINITY;
+    for (const message of existing) {
+        if (message.role !== "assistant") continue;
+        const ms = Date.parse(message.createdAt);
+        if (Number.isFinite(ms) && ms > floorMs) floorMs = ms;
+    }
+    const finalMs = parsed > floorMs ? parsed : (Number.isFinite(floorMs) ? floorMs + 1000 : parsed);
+    return new Date(finalMs).toISOString();
+}
+
 function getTimedWakeIdFromTriggerKey(triggerKey: string | null): string | null {
     if (!triggerKey?.startsWith("timedwake:")) return null;
     const id = triggerKey.slice("timedwake:".length);
@@ -132,7 +158,9 @@ export async function consumeServerOutbox(options?: { silent?: boolean; force?: 
                                     {
                                         silent: options?.silent !== false,
                                         responseBatchId,
-                                        createdAt: bridgeMeta.screenChatAssistantAt,
+                                        // 屏幕速聊自带精确的话术时刻，优先用它；没有才退回 outbox 行的时间。
+                                        createdAt: bridgeMeta.screenChatAssistantAt
+                                            || resolveOutboxCreatedAt(entry.created_at, existing),
                                     },
                                 );
                                 if (hasVisible && newCount < 10) scheduleFollowUp(replySessionId, newCount, stateValues);
@@ -240,7 +268,13 @@ export async function consumeServerOutbox(options?: { silent?: boolean; force?: 
                         meta.prevCount ?? 0,
                         followUpIndex,
                         existingMessages,
-                        { silent: options?.silent !== false, ...(shortcutMarker ? { shortcutMarker } : {}) },
+                        {
+                            silent: options?.silent !== false,
+                            ...(shortcutMarker ? { shortcutMarker } : {}),
+                            // 用服务端生成它的时刻落库，而不是这次打开 App 的时刻。
+                            // parseAndSaveResponse 会在此基础上按气泡顺序逐条 +1ms。
+                            createdAt: resolveOutboxCreatedAt(entry.created_at, existingMessages),
+                        },
                     );
                     if (hasVisible && newCount < 10) scheduleFollowUp(sessionId, newCount, stateValues);
                     clearTimedWakeIfHandled(entry.trigger_key);

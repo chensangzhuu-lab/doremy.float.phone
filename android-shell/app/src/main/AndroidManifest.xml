@@ -161,6 +161,14 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- 推送诊断（仅调试用）：在电脑上 chrome://inspect 看不到 logcat，
+             用 adb 又常常被 VPN / 数据线拦住。这里开一个 localhost-only 的
+             HTTP 端口，手机浏览器打开 http://127.0.0.1:8787/ 就能看推送轨迹。
+             只监听回环地址、只读、不写任何文件，也不含 Cookie 与 key。 -->
+        <service
+            android:name=".PushDebugServer"
+            android:exported="false" />
+
         <receiver
             android:name=".BootReceiver"
             android:exported="true">

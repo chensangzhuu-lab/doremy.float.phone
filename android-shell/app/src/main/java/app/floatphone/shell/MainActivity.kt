@@ -837,6 +837,26 @@ class MainActivity : AppCompatActivity() {
         fun getDeviceActionCapabilities(): String = deviceAction.capabilitiesJson()
 
         /**
+         * 离线推送链路诊断（JSON 字符串）。
+         *
+         * 推送这套是「服务端广播 → Supabase Realtime → 壳内长连接 → 系统通知」四段，
+         * 过去任何一段断掉，用户能看到的都只有常驻通知里一句「未登录或站点不可达」。
+         * 这里把每一段的实况交给网页侧的「推送诊断」面板：配置取到了没、频道
+         * 订阅成功没、订阅注册成功没、收到过几条广播、以及最近 40 条轨迹。
+         * 只含状态与时间，不含 Cookie / key / 聊天内容。
+         */
+        @JavascriptInterface
+        fun getPushDiagnostics(): String = PushService.diagnosticsJson()
+
+        /** 前端点「重连」用：不卸载服务的前提下踢掉当前长连接，让它按退避策略立刻重连。 */
+        @JavascriptInterface
+        fun restartPushService(): Boolean = runCatching {
+            PushService.start(this@MainActivity)
+            PushService.requestReconnect()
+            true
+        }.getOrDefault(false)
+
+        /**
          * 跳系统授权页。which = write_settings / dnd / accessibility / battery / app_details。
          * 由网页在用户点「去授权」时调用，壳不主动跳。
          */

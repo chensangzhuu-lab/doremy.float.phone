@@ -26,8 +26,10 @@ android {
         // 1.0.10：浮窗改圆角矩形；浮窗左上角显示「待发 N」角标。
         // 1.0.11：截屏与主动查岗（含查岗浮层回复框）；通知栏「直接回复」。
         // 1.0.12：截屏可选收件人；位置感知；睡眠（Health Connect）。
-        versionCode 11
-        versionName "1.0.12"
+        // 1.0.13：推送链路诊断（常驻通知带真实失败原因 + getPushDiagnostics
+        //          + 手动重连）；测试广播把服务端失败原因带回来。
+        versionCode 12
+        versionName "1.0.13"
         buildConfigField "String", "SITE_URL", "\"${siteUrl}\""
     }
 

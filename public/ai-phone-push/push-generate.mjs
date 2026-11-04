@@ -1194,7 +1194,11 @@ Deno.serve(async (req: Request) => {
               })),
             }),
           });
-          await response.text().catch(() => undefined);
+          const broadcastText = await response.text().catch(() => "");
+          // 把广播结果写进 result_note：过去这里只回一个状态码，一旦 4xx（多半是
+          // realtime 未启用广播、或服务端 key 不被接受），任务照样记 done、pushed 不加，
+          // 用户在手机上只看到"什么都没发生"，没有任何线索。
+          if (!response.ok) await progress(`shell broadcast http ${response.status}: ${broadcastText.slice(0, 120)}`);
           if (response.ok) pushed += 1;
           else pushErrors.push(`shell http ${response.status}`);
         } catch (err) {

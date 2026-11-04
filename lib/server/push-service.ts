@@ -42,13 +42,16 @@ export type PushSendResult = {
 // 改由 Supabase Realtime 广播送达壳内长连接（PushService）。
 const SHELL_ENDPOINT_PREFIX = "shell:";
 
+/** 广播结果：ok 之外还带一份人话说明，供「测试」接口把失败原因直接显示给用户。 */
+export type ShellBroadcastResult = { ok: boolean; status?: number; detail?: string };
+
 /** 向安卓壳的个人频道 shellpush:<userId> 广播一条通知（尽力而为）。 */
-export async function broadcastShellNotify(
+export async function broadcastShellNotifyWithDetail(
   userId: string,
   message: { title: string; body: string; url?: string },
-): Promise<boolean> {
+): Promise<ShellBroadcastResult> {
   const config = getSupabaseServerConfig();
-  if (!config) return false;
+  if (!config) return { ok: false, detail: "站点未配置 SUPABASE_SERVICE_ROLE_KEY，无法广播" };
   try {
     const response = await fetch(`${config.url}/realtime/v1/api/broadcast`, {
       method: "POST",
@@ -66,11 +69,25 @@ export async function broadcastShellNotify(
       }),
       cache: "no-store",
     });
-    await response.text().catch(() => undefined);
-    return response.ok;
-  } catch {
-    return false;
+    const text = await response.text().catch(() => "");
+    // Realtime 广播接口对「未启用广播」等情况会返回 4xx 并带一句原因。
+    // 过去这里把响应体直接丢掉、只回一个布尔，于是站点测试接口永远只能报
+    // 「shell broadcast failed」，用户完全不知道该去 Supabase 面板开什么。
+    return {
+      ok: response.ok,
+      status: response.status,
+      detail: response.ok ? undefined : text.slice(0, 200) || `HTTP ${response.status}`,
+    };
+  } catch (err) {
+    return { ok: false, detail: err instanceof Error ? err.message : String(err) };
   }
+}
+
+export async function broadcastShellNotify(
+  userId: string,
+  message: { title: string; body: string; url?: string },
+): Promise<boolean> {
+  return (await broadcastShellNotifyWithDetail(userId, message)).ok;
 }
 
 /** VAPID subject 必须是 https: 或 mailto:。本地 http 环境回退到 mailto。 */
@@ -198,9 +215,9 @@ export async function sendPushToUser(
   const shellSubs = subs.data.filter(sub => sub.endpoint.startsWith(SHELL_ENDPOINT_PREFIX));
   const webSubs = subs.data.filter(sub => !sub.endpoint.startsWith(SHELL_ENDPOINT_PREFIX));
   if (shellSubs.length > 0) {
-    const ok = await broadcastShellNotify(userId, { title: message.title, body: message.body, url: navigate });
-    if (ok) result.sent += shellSubs.length;
-    else result.errors.push("shell broadcast failed");
+    const broadcast = await broadcastShellNotifyWithDetail(userId, { title: message.title, body: message.body, url: navigate });
+    if (broadcast.ok) result.sent += shellSubs.length;
+    else result.errors.push(`shell broadcast failed: ${broadcast.detail || "unknown"}`);
   }
 
   for (const sub of webSubs) {

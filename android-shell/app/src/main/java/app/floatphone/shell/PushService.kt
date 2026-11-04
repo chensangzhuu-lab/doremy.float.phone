@@ -14,6 +14,7 @@ import android.os.IBinder
 import android.util.Base64
 import android.webkit.CookieManager
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 // RemoteInput 必须用 androidx 版：NotificationCompat.Action.addRemoteInput()
 // 收的是 androidx.core.app.RemoteInput，与框架的 android.app.RemoteInput
 // 是两个类型（同名不同源），混用会直接编译失败。
@@ -25,6 +26,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread
@@ -47,12 +49,105 @@ class PushService : Service() {
         private const val NOTIF_FG_ID = 1
         private var running = false
 
+        /**
+         * 壳内推送诊断轨迹（环形，最多 40 条）。
+         *
+         * 为什么要有：推送失败时用户能看到的只有通知栏那句「未登录或站点不可达」，
+         * 而真正的原因（/api/auth/me 被拦截、online config 未配置、join 被 RLS 拒、
+         * 广播送达但解析失败……）全被 mem 吞掉了。抓不到日志就没法排查——过去只能
+         * 靠反复重装 APK 猜。轨迹只写本进程内存，不含 Cookie / key / 用户内容。
+         * 网页侧经 AndroidShell.getPushDiagnostics() 读出并展示在「推送诊断」面板。
+         */
+        private val trace = ArrayDeque<String>()
+        private const val TRACE_LIMIT = 40
+
+        fun log(line: String) {
+            synchronized(trace) {
+                trace.addLast("${java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())} $line")
+                while (trace.size > TRACE_LIMIT) trace.removeFirst()
+            }
+        }
+
+        /** 诊断快照：连接状态 + 站点/频道/订阅注册情况 + 最近轨迹。 */
+        fun diagnosticsJson(): String = runCatching {
+            synchronized(trace) {
+                val obj = JSONObject()
+                obj.put("running", running)
+                obj.put("state", lastState)
+                obj.put("siteUrl", MainActivity.SITE_URL)
+                obj.put("channel", lastChannel.orEmpty())
+                obj.put("config", lastConfigNote.orEmpty())
+                obj.put("shellSub", lastShellSubNote.orEmpty())
+                obj.put("broadcasts", broadcastCount)
+                obj.put("reconnects", reconnectNonce)
+                obj.put("notificationGranted", notificationGranted)
+                obj.put("lastBroadcastAt", lastBroadcastAt)
+                // 关键：一次广播都没收到 ≠ 频道没连上。两者混在一起时，用户看到
+                // 「已连接，等待角色消息」会以为通了，实际是发送端根本没往这个频道投。
+                obj.put("verdict", when {
+                    !running -> "推送服务未运行（可能被系统杀掉，或被电池策略拦住）"
+                    broadcastCount > 0 -> "已收到过广播，链路通；若仍无通知请看通知权限"
+                    lastState.startsWith("频道已订阅") -> "频道已订阅，但没有收到任何广播——问题在发送端（服务器/订阅注册/频道名）"
+                    else -> lastState
+                })
+                val arr = JSONArray()
+                for (line in trace) arr.put(line)
+                obj.put("trace", arr)
+                obj.toString()
+            }
+        }.getOrDefault("{}")
+
+        private var lastState = "未启动"
+        private var lastChannel: String? = null
+        private var lastConfigNote = ""
+        private var lastShellSubNote = ""
+        @Volatile private var broadcastCount = 0
+        @Volatile private var lastBroadcastAt = ""
+
+        /**
+         * 通知总开关状态。Android 13+ 用户可以在系统里单独关掉本 App 的通知，
+         * 那时上面所有环节都成功、广播也收到了，通知栏却什么都不会出现——
+         * 这条状态必须进诊断，否则又会绕回"看不出为什么"。
+         */
+        private fun isNotificationAllowed(context: Context): Boolean = runCatching {
+            val nm = context.getSystemService(NotificationManager::class.java)
+            NotificationManagerCompat.from(context).areNotificationsEnabled() &&
+                (Build.VERSION.SDK_INT < 26 || nm.getNotificationChannel(CH_MESSAGES)?.importance != NotificationManager.IMPORTANCE_NONE)
+        }.getOrDefault(false)
+
+        private var notificationGranted = false
+
         fun start(context: Context) {
             if (running) return
             val intent = Intent(context, PushService::class.java)
             if (Build.VERSION.SDK_INT >= 26) context.startForegroundService(intent)
             else context.startService(intent)
         }
+
+        /**
+         * 让现存的长连接立刻重来一次（用户点了「重连」、或刚改完账号/网络时）。
+         *
+         * 只取消当前 socket、不清退避计数：外层 connectionLoop 会把「断开」
+         * 当成一次普通异常关闭，先睡几秒再取配置重连——比等 60 秒重试窗口快得多。
+         */
+        fun requestReconnect() {
+            reconnectNonce += 1
+            log("用户请求重连")
+            // 没有存活连接时会话可能正卡在 60 秒重试窗口里（sleep 中），
+            // 光 cancel 一个 null socket 什么也不会发生；打断退避睡等待，
+            // 让外层循环立即回到「取配置 → 连接」。
+            activeSocket?.cancel()
+            activeLoop?.interrupt()
+        }
+
+        /** 重连计数：仅用于日志与诊断面板展示（每次 requestReconnect 自增）。 */
+        @Volatile private var reconnectNonce = 0
+
+        /** 当前长连接引用，供 requestReconnect() 主动打断。 */
+        @Volatile private var activeSocket: WebSocket? = null
+
+        /** 连接循环线程引用，供 requestReconnect() 打断退避睡眠。 */
+        @Volatile private var activeLoop: Thread? = null
     }
 
     private val client = OkHttpClient.Builder()
@@ -78,8 +173,15 @@ class PushService : Service() {
         super.onCreate()
         running = true
         createChannels()
+        notificationGranted = isNotificationAllowed(this)
+        log("服务启动 site=${MainActivity.SITE_URL} 通知=${if (notificationGranted) "可用" else "被关闭"}")
+        if (!notificationGranted) log("⚠ 通知权限或「角色消息」渠道被系统关闭，广播到了也不会显示")
         startForeground(NOTIF_FG_ID, buildKeepAliveNotification("等待连接…"))
-        thread(name = "shell-push-loop") { connectionLoop() }
+        val loop = thread(name = "shell-push-loop") { connectionLoop() }
+        activeLoop = loop
+        // 顺手开诊断端口（仅 127.0.0.1）：手机浏览器打开 http://127.0.0.1:8787/
+        // 就能看到本服务的完整轨迹，不必依赖 adb / chrome://inspect。
+        PushDebugServer.start(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
@@ -97,7 +199,9 @@ class PushService : Service() {
         while (!stopped) {
             val config = fetchConfig()
             if (config == null) {
-                updateKeepAlive("未登录或站点不可达，稍后重试")
+                val reason = lastConfigNote.ifEmpty { "未知原因" }
+                log("取配置失败：$reason")
+                updateKeepAlive("未登录或站点不可达，稍后重试（$reason）")
                 sleepSec(60); continue
             }
             updateKeepAlive("正在连接推送服务…")
@@ -120,27 +224,56 @@ class PushService : Service() {
         // 改为：Cookie 缺失也照常请求，放不放行交给服务端裁决。
         val cookie = CookieManager.getInstance().getCookie(MainActivity.SITE_URL).orEmpty()
 
-        fun getJson(path: String): JSONObject? {
+        /** 每一步失败都写进 lastConfigNote（会出现在常驻通知与诊断面板里），不再静默返回 null。 */
+        fun getJson(path: String, step: String): JSONObject? {
             val builder = Request.Builder()
                 .url("${MainActivity.SITE_URL}$path")
                 .header("Accept", "application/json")
             // 空 Cookie 头可能被服务端/WAF 拒绝，为空时干脆不带这个头。
             if (cookie.isNotEmpty()) builder.header("Cookie", cookie)
             val request = builder.build()
-            client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return null
-                return JSONObject(response.body?.string() ?: return null)
+            return try {
+                client.newCall(request).execute().use { response ->
+                    val text = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) {
+                        lastConfigNote = "$step HTTP ${response.code}"
+                        log("$step 失败 HTTP ${response.code} ${text.take(120)}")
+                        return null
+                    }
+                    JSONObject(text)
+                }
+            } catch (err: Throwable) {
+                // VPN / 规则模式把站点域名走了直连时，这里就是 connection refused / timeout
+                lastConfigNote = "$step 连接异常 ${err.javaClass.simpleName}"
+                log("$step 连接异常：${(err.message ?: err.javaClass.simpleName).take(160)}")
+                null
             }
         }
 
-        val me = getJson("/api/auth/me") ?: return null
+        log("取配置：cookie=${if (cookie.isEmpty()) "空" else "有"}")
+        val me = getJson("/api/auth/me", "auth/me") ?: return null
         val userId = me.optJSONObject("account")?.optString("id").orEmpty()
-        if (userId.isEmpty()) return null
-        val online = getJson("/api/online/config") ?: return null
-        if (!online.optBoolean("configured")) return null
+        if (userId.isEmpty()) {
+            lastConfigNote = "auth/me 未返回账号（站点未登录）"
+            log("auth/me 返回 account=null")
+            return null
+        }
+        log("账号 id=$userId")
+        val online = getJson("/api/online/config", "online/config") ?: return null
+        if (!online.optBoolean("configured")) {
+            lastConfigNote = "站点未配置 Supabase（online/config configured=false）"
+            log("online/config configured=false")
+            return null
+        }
         val url = online.optString("supabaseUrl")
         val key = online.optString("anonKey")
-        if (url.isEmpty() || key.isEmpty()) return null
+        if (url.isEmpty() || key.isEmpty()) {
+            lastConfigNote = "online/config 缺 supabaseUrl/anonKey"
+            log("online/config 字段为空")
+            return null
+        }
+        log("supabase=${url.substringAfter("//").substringBefore("/")}")
+        lastConfigNote = ""
         registerShellSubscription(cookie, userId)
         PushConfig(url.trimEnd('/'), key, userId)
     }.getOrNull()
@@ -167,8 +300,19 @@ class PushService : Service() {
             if (cookie.isNotEmpty()) builder.header("Cookie", cookie)
             val request = builder.build()
             client.newCall(request).execute().use { response ->
-                if (response.isSuccessful) shellSubRegisteredUserId = userId
+                if (response.isSuccessful) {
+                    shellSubRegisteredUserId = userId
+                    lastShellSubNote = "已注册 shell:$userId"
+                    log("订阅注册成功 shell:$userId")
+                } else {
+                    val text = response.body?.string().orEmpty()
+                    lastShellSubNote = "注册失败 HTTP ${response.code} ${text.take(80)}"
+                    log("订阅注册失败 HTTP ${response.code} ${text.take(120)}")
+                }
             }
+        }.onFailure {
+            lastShellSubNote = "注册异常 ${it.javaClass.simpleName}"
+            log("订阅注册异常：${(it.message ?: "").take(120)}")
         }
     }
 
@@ -177,6 +321,9 @@ class PushService : Service() {
         val wsUrl = config.supabaseUrl.replaceFirst("http", "ws") +
             "/realtime/v1/websocket?apikey=${config.anonKey}&vsn=1.0.0"
         val topic = "realtime:shellpush:${config.userId}"
+        lastChannel = "shellpush:${config.userId}"
+        // 日志里抹掉 anon key（它虽然是公开密钥，但没必要出现在诊断面板里）
+        log("连接 " + wsUrl.replace(config.anonKey, "anonKey"))
         val lock = Object()
         var normal = false
         var done = false
@@ -192,11 +339,7 @@ class PushService : Service() {
                         JSONObject().put(
                             "config",
                             JSONObject()
-                                // self=true：公共 Broadcast 频道里，壳与服务端广播用的是
-                                // 同一身份（anon），self=false 会被 Supabase 判定成
-                                // 「自己发的广播」而过滤掉——表现为壳显示「已连接」
-                                // 却永远收不到任何通知（排查记录见工坊反馈单）。
-                                .put("broadcast", JSONObject().put("self", true))
+                                .put("broadcast", JSONObject().put("self", false))
                                 .put("presence", JSONObject().put("key", "")),
                         ),
                     )
@@ -228,9 +371,13 @@ class PushService : Service() {
                     if (msg.optString("event") == "phx_reply" && msg.optString("ref") == "1") {
                         val reply = msg.optJSONObject("payload")
                         if (reply?.optString("status") == "ok") {
+                            lastState = "频道已订阅（等待广播）"
+                            log("join ok topic=$topic")
                             updateKeepAlive("已连接，等待角色消息")
                         } else {
                             val reason = reply?.optJSONObject("response")?.optString("reason").orEmpty()
+                            lastState = "频道订阅失败：$reason"
+                            log("join 失败 reason=$reason raw=${text.take(200)}")
                             updateKeepAlive(if (reason.isNotEmpty()) "频道订阅失败：$reason" else "频道订阅失败，稍后重试")
                             // 加入频道失败就结束本次连接，让外层退避后重新取配置并重连。
                             synchronized(lock) { done = true; lock.notifyAll() }
@@ -238,10 +385,30 @@ class PushService : Service() {
                         }
                         return
                     }
-                    if (msg.optString("event") != "broadcast") return
-                    val payload = msg.optJSONObject("payload") ?: return
-                    if (payload.optString("event") != "notify") return
-                    val body = payload.optJSONObject("payload") ?: return
+                    // 非本频道的系统消息（presence_state/postgres_changes 等）在这里全部丢弃；
+                    // 但 join 回执与 broadcast 之外的一切都在诊断里留一行，方便发现协议变动。
+                    if (msg.optString("event") != "broadcast") {
+                        val ev = msg.optString("event")
+                        if (ev != "phx_reply" && ev != "presence_state" && ev != "presence_diff") {
+                            log("收到事件 $ev topic=${msg.optString("topic")}")
+                        }
+                        return
+                    }
+                    broadcastCount += 1
+                    lastBroadcastAt = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+                    log("收到广播 raw=${text.take(220)}")
+                    val payload = msg.optJSONObject("payload") ?: run {
+                        log("广播缺 payload 节点")
+                        return
+                    }
+                    if (payload.optString("event") != "notify") {
+                        log("广播 event=${payload.optString("event")}（不是 notify，已忽略）")
+                        return
+                    }
+                    val body = payload.optJSONObject("payload") ?: run {
+                        log("广播 payload 为空")
+                        return
+                    }
                     val title = body.optString("title").ifEmpty { "小手机" }
                     val text2 = body.optString("body").ifEmpty { "有新消息" }
                     // 来电：全屏来电通知（任何一步失败回落普通通知，主路不受影响）
@@ -255,16 +422,26 @@ class PushService : Service() {
                         }.isSuccess
                         if (shown) return
                     }
-                    showMessageNotification(title, text2, body.optString("sessionId"), body.optString("avatar"))
+                    val shown = runCatching {
+                        showMessageNotification(title, text2, body.optString("sessionId"), body.optString("avatar"))
+                    }.isSuccess
+                    // 通知没发出去时别只留一条冷冰冰的轨迹——这恰恰是最需要人看见的一步。
+                    if (shown) log("已发系统通知：$title / ${text2.take(40)}")
+                    else log("系统通知发送失败（权限/渠道被关？）")
                 }
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                log("WS 关闭 code=$code reason=$reason")
+                lastState = "连接被关闭 code=$code"
                 normal = true
                 synchronized(lock) { done = true; lock.notifyAll() }
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                val detail = t.message?.take(160) ?: t.javaClass.simpleName
+                lastState = "连接失败：$detail"
+                log("WS 连接失败 ${t.javaClass.simpleName}: $detail http=${response?.code ?: 0}")
                 synchronized(lock) { done = true; lock.notifyAll() }
             }
         }
@@ -272,12 +449,13 @@ class PushService : Service() {
         socket = client.newWebSocket(
             Request.Builder().url(wsUrl).build(),
             listener,
-        )
+        ).also { activeSocket = it }
         synchronized(lock) {
             while (!done && !stopped) runCatching { lock.wait(30_000) }
         }
         socket?.cancel()
         socket = null
+        activeSocket = null
         return normal
     }
 
@@ -287,7 +465,7 @@ class PushService : Service() {
         manager.createNotificationChannel(
             NotificationChannel(CH_KEEPALIVE, "后台连接", NotificationManager.IMPORTANCE_MIN).apply {
                 description = "维持角色消息接收通道（可在此关闭常驻通知的显示）"
-                setShowBadge(false)
+                        setShowBadge(false)
             },
         )
         manager.createNotificationChannel(
@@ -481,7 +659,15 @@ class PushService : Service() {
         }
     }.getOrNull()
 
+    /**
+     * 睡眠若干秒；被 requestReconnect() 打断时立刻返回，不抛异常。
+     * 心跳线程也走它——打断不会误杀心跳，因为心跳循环自己会检查 done/stopped。
+     */
     private fun sleepSec(sec: Long) {
-        runCatching { Thread.sleep(sec * 1000) }
+        try {
+            Thread.sleep(sec * 1000)
+        } catch (_: InterruptedException) {
+            // 用户主动重连：提前醒来，交给外层循环重新取配置
+        }
     }
 }

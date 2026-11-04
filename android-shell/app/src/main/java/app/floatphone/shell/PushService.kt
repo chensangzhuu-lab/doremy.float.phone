@@ -192,7 +192,11 @@ class PushService : Service() {
                         JSONObject().put(
                             "config",
                             JSONObject()
-                                .put("broadcast", JSONObject().put("self", false))
+                                // self=true：公共 Broadcast 频道里，壳与服务端广播用的是
+                                // 同一身份（anon），self=false 会被 Supabase 判定成
+                                // 「自己发的广播」而过滤掉——表现为壳显示「已连接」
+                                // 却永远收不到任何通知（排查记录见工坊反馈单）。
+                                .put("broadcast", JSONObject().put("self", true))
                                 .put("presence", JSONObject().put("key", "")),
                         ),
                     )

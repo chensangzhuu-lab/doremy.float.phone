@@ -3179,6 +3179,63 @@
   background: rgba(127, 144, 164, 0.08);
 }
 
+/* ── 长按菜单「翻译」气泡下方的译文（仅本地内存，不落库） ── */
+.chat-msg-translation {
+  margin-top: 5px;
+  padding: 7px 10px;
+  border-radius: 10px;
+  border: 1px dashed color-mix(in srgb, var(--c-card-border) 72%, transparent);
+  background: color-mix(in srgb, var(--c-input) 82%, transparent);
+  color: var(--c-text);
+  font-size: calc(12.5px*var(--app-text-scale,1));
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+  animation: chat-translation-in 0.16s ease-out;
+}
+
+.chat-msg-translation-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 3px;
+  color: var(--c-icon);
+  font-size: calc(9.9px*var(--app-text-scale,1));
+  letter-spacing: 0.04em;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.chat-msg-translation-copy {
+  border: none;
+  background: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline;
+  text-decoration-color: rgba(127, 144, 164, 0.28);
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.chat-msg-translation-body {
+  opacity: 0.92;
+}
+
+@keyframes chat-translation-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-msg-translation {
+    animation: none;
+  }
+}
+
 /* ── Bilingual text block ── */
 .chat-bilingual-block {
   display: flex;

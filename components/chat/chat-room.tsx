@@ -8,6 +8,7 @@ import { parseStateValues, mergeStateValues } from "@/lib/state-value-parser";
 import { parseAIResponse, type ParsedMessagePart } from "@/lib/rich-message-parser";
 import { isKnownStickerLabel } from "@/lib/sticker-data";
 import { translateReasoningText } from "@/lib/reasoning-translate";
+import { translateMessageText, getTranslatableMessageText } from "@/lib/message-translate";
 import { MessageBubble, MediaDetailModal, prewarmStickerCache, BilingualTextBlock, isStandaloneHtmlPreviewContent, normalizeTextBubbleContent } from "./message-bubble";
 import { GeneratedImageErrorDialog } from "./generated-image-error-dialog";
 import { PhotoInputModal, TextPhotoModal, VoiceRecordModal, RedPacketModal, LocationInputModal, SystemInstructionModal } from "./rich-input-modals";
@@ -1393,6 +1394,38 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         }
     };
     const [voiceTextIds, setVoiceTextIds] = useState<Set<string>>(new Set());
+    // 长按菜单「翻译」：译文只放内存（按消息 id），不落库、不进 AI 上下文，
+    // 退出聊天室即清理；同一条再次点「翻译」即收起。
+    const [messageTranslations, setMessageTranslations] = useState<Record<string, string>>({});
+    const [messageTranslatingId, setMessageTranslatingId] = useState<string | null>(null);
+    const handleTranslateMessage = async (msg: ChatMessage) => {
+        setActiveMessageId(null);
+        if (messageTranslations[msg.id]) {
+            setMessageTranslations(prev => {
+                const next = { ...prev };
+                delete next[msg.id];
+                return next;
+            });
+            return;
+        }
+        const text = getTranslatableMessageText(msg);
+        if (!text) {
+            showChatToast("这条消息没有可翻译的文字");
+            return;
+        }
+        if (messageTranslatingId) return;
+        setMessageTranslatingId(msg.id);
+        try {
+            const result = await translateMessageText(text);
+            if (result.content) {
+                setMessageTranslations(prev => ({ ...prev, [msg.id]: result.content as string }));
+            } else {
+                showChatToast(result.error || "翻译失败，请重试", 3500);
+            }
+        } finally {
+            setMessageTranslatingId(null);
+        }
+    };
     const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
     const [editingContent, setEditingContent] = useState("");
     const [editingResponseBatchId, setEditingResponseBatchId] = useState<string | null>(null);
@@ -5159,6 +5192,15 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                         }
                         setActiveMessageId(null);
                     }} className="ctx-menu-btn">复制</button>
+                    {!m.mediaType || m.mediaType === "quote" || m.mediaType === "audio" ? (
+                        <button
+                            onClick={() => { void handleTranslateMessage(m); }}
+                            className="ctx-menu-btn"
+                            {...(messageTranslatingId === m.id ? { disabled: true } : {})}
+                        >
+                            {messageTranslations[m.id] ? "收起翻译" : messageTranslatingId === m.id ? "翻译中…" : "翻译"}
+                        </button>
+                    ) : null}
                     <button onClick={() => (m.role === "assistant" ? handleEditResponseStart(m) : handleEditMessageStart(m))} className="ctx-menu-btn">
                         {m.role === "assistant" && (m.rawResponseText || m.editableResponseText) ? "编辑回复" : "编辑"}
                     </button>
@@ -6502,6 +6544,23 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                                 defaultTranslationExpanded={session.collapseBilingualTranslation !== false ? false : true}
                                             />
                                         </div>
+                                            {messageTranslations[msg.id] && (
+                                                <div className="chat-msg-translation" onClick={(e) => e.stopPropagation()}>
+                                                    <div className="chat-msg-translation-head">
+                                                        <span>译文</span>
+                                                        <button
+                                                            type="button"
+                                                            className="chat-msg-translation-copy"
+                                                            onClick={() => {
+                                                                const text = messageTranslations[msg.id];
+                                                                copyTextToClipboard(text);
+                                                                showChatToast("译文已复制");
+                                                            }}
+                                                        >复制</button>
+                                                    </div>
+                                                    <div className="chat-msg-translation-body">{messageTranslations[msg.id]}</div>
+                                                </div>
+                                            )}
                                         </div>}
                                         {msg.role !== "user" && !isSilentThought && !isEmptyBubble && hasFoldedPanel && (
                                             <button

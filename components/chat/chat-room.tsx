@@ -1426,6 +1426,41 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             setMessageTranslatingId(null);
         }
     };
+    // 线下模式「翻译」：按「turnId:role」存译文，同样只放内存、不落库
+    const [offlineTranslations, setOfflineTranslations] = useState<Record<string, string>>({});
+    const [offlineTranslatingKey, setOfflineTranslatingKey] = useState<string | null>(null);
+    const offlineTranslateAvailable = (turn: ChatOfflineTurn, role: OfflineActionTarget["role"]) => (
+        Boolean((role === "user" ? turn.userContent : turn.assistantContent || "").trim())
+    );
+    const handleTranslateOfflineTurn = async (turn: ChatOfflineTurn, role: OfflineActionTarget["role"]) => {
+        setActiveOfflineTarget(null);
+        const key = `${turn.id}:${role}`;
+        if (offlineTranslations[key]) {
+            setOfflineTranslations(prev => {
+                const next = { ...prev };
+                delete next[key];
+                return next;
+            });
+            return;
+        }
+        const source = (role === "user" ? turn.userContent : turn.assistantContent || "").trim();
+        if (!source) {
+            showChatToast("这条内容没有可翻译的文字");
+            return;
+        }
+        if (offlineTranslatingKey) return;
+        setOfflineTranslatingKey(key);
+        try {
+            const result = await translateMessageText(source);
+            if (result.content) {
+                setOfflineTranslations(prev => ({ ...prev, [key]: result.content as string }));
+            } else {
+                showChatToast(result.error || "翻译失败，请重试", 3500);
+            }
+        } finally {
+            setOfflineTranslatingKey(null);
+        }
+    };
     const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
     const [editingContent, setEditingContent] = useState("");
     const [editingResponseBatchId, setEditingResponseBatchId] = useState<string | null>(null);
@@ -5101,6 +5136,15 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             >
                 <div className="flex">
                     <button onClick={() => { copyTextToClipboard(getOfflineCopyText(turn, role)); setActiveOfflineTarget(null); }} className="ctx-menu-btn">复制</button>
+                    {offlineTranslateAvailable(turn, role) ? (
+                        <button
+                            onClick={() => { void handleTranslateOfflineTurn(turn, role); }}
+                            className="ctx-menu-btn"
+                            {...(offlineTranslatingKey === `${turn.id}:${role}` ? { disabled: true } : {})}
+                        >
+                            {offlineTranslations[`${turn.id}:${role}`] ? "收起翻译" : offlineTranslatingKey === `${turn.id}:${role}` ? "翻译中…" : "翻译"}
+                        </button>
+                    ) : null}
                     <button onClick={() => handleOfflineEditStart(turn, role)} className="ctx-menu-btn">编辑</button>
                     <button onClick={() => void handleOfflineRetryFrom(turn.id)} className="ctx-menu-btn ctx-menu-btn-danger">重试以下</button>
                 </div>
@@ -5974,6 +6018,22 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                             defaultExpanded={session.collapseBilingualTranslation !== false ? false : true}
                                         />
                                     </div>
+                                    {offlineTranslations[`${turn.id}:user`] && (
+                                        <div className="chat-msg-translation">
+                                            <div className="chat-msg-translation-head">
+                                                <span>译文</span>
+                                                <button
+                                                    type="button"
+                                                    className="chat-msg-translation-copy"
+                                                    onClick={() => {
+                                                        copyTextToClipboard(offlineTranslations[`${turn.id}:user`]);
+                                                        showChatToast("译文已复制");
+                                                    }}
+                                                >复制</button>
+                                            </div>
+                                            <div className="chat-msg-translation-body">{offlineTranslations[`${turn.id}:user`]}</div>
+                                        </div>
+                                    )}
                                 </div>
                                 <div className="chat-offline-entry" data-role="assistant">
                                     {/* 头像占位：默认 display:none（见 chat.css），供自定义 CSS 显示 */}
@@ -6041,6 +6101,22 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                             defaultExpanded={session.collapseBilingualTranslation !== false ? false : true}
                                         />
                                     </div>
+                                    {offlineTranslations[`${turn.id}:assistant`] && (
+                                        <div className="chat-msg-translation">
+                                            <div className="chat-msg-translation-head">
+                                                <span>译文</span>
+                                                <button
+                                                    type="button"
+                                                    className="chat-msg-translation-copy"
+                                                    onClick={() => {
+                                                        copyTextToClipboard(offlineTranslations[`${turn.id}:assistant`]);
+                                                        showChatToast("译文已复制");
+                                                    }}
+                                                >复制</button>
+                                            </div>
+                                            <div className="chat-msg-translation-body">{offlineTranslations[`${turn.id}:assistant`]}</div>
+                                        </div>
+                                    )}
                                     {turn.summary.trim() && (
                                         <details className="chat-offline-summary-fold">
                                             <summary>摘要（{turn.summaryTag || "summary"}）</summary>

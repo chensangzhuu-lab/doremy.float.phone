@@ -103,6 +103,7 @@ import {
   synthesizeSpeech,
   unlockAudioPlayback,
 } from "@/lib/tts-service";
+import { translateMessageText } from "@/lib/message-translate";
 
 type StoryAppProps = {
   onClose: () => void;
@@ -526,6 +527,10 @@ export function StoryApp({ onClose }: StoryAppProps) {
   const [playingVoiceSegmentId, setPlayingVoiceSegmentId] = useState<string | null>(null);
   const [voiceNotice, setVoiceNotice] = useState<string | null>(null);
   const [voiceSequenceProgress, setVoiceSequenceProgress] = useState({ current: 0, total: 0 });
+  // 剧情消息「翻译」：按消息 id 存译文，只放内存（不落库、不进 AI 上下文），
+  // 切会话/退出剧情即清空，避免把译文学进剧情记忆。
+  const [messageTranslations, setMessageTranslations] = useState<Record<string, string>>({});
+  const [translatingMessageId, setTranslatingMessageId] = useState<string | null>(null);
   const [autoReading, setAutoReading] = useState(false);
   const [currentReadExpanded, setCurrentReadExpanded] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -731,6 +736,9 @@ export function StoryApp({ onClose }: StoryAppProps) {
   useEffect(() => {
     setAutoReading(false);
     setCurrentReadExpanded(false);
+    // 切换剧情分线时清掉上一条分线的译文，避免串到别的分支上
+    setMessageTranslations({});
+    setTranslatingMessageId(null);
   }, [activeSessionId]);
 
   // Listen for live CSS updates from 小卷
@@ -1776,6 +1784,38 @@ export function StoryApp({ onClose }: StoryAppProps) {
     setEditingContent("");
     setStorageVersion(v => v + 1);
   }
+  /** 剧情消息「翻译」：原文优先用 rawContent（未渲染存稿），去掉 HTML 标签后送翻 */
+  async function handleStoryTranslate(message: StoryMessage) {
+    setActiveMessageId(null);
+    if (messageTranslations[message.id]) {
+      setMessageTranslations(prev => {
+        const next = { ...prev };
+        delete next[message.id];
+        return next;
+      });
+      return;
+    }
+    const source = (message.rawContent || message.renderedContent || "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!source) {
+      showVoiceNotice("这条消息没有可翻译的文字");
+      return;
+    }
+    if (translatingMessageId) return;
+    setTranslatingMessageId(message.id);
+    try {
+      const result = await translateMessageText(source);
+      if (result.content) {
+        setMessageTranslations(prev => ({ ...prev, [message.id]: result.content as string }));
+      } else {
+        showVoiceNotice(result.error || "翻译失败，请重试");
+      }
+    } finally {
+      setTranslatingMessageId(null);
+    }
+  }
   function handleStoryCopy(text: string) {
     const fallbackCopy = () => {
       const ta = document.createElement("textarea");
@@ -2147,6 +2187,19 @@ export function StoryApp({ onClose }: StoryAppProps) {
                             />
                           )}
                         </div>
+                        {messageTranslations[message.id] ? (
+                          <div className="story-msg-translation">
+                            <div className="story-msg-translation-head">
+                              <span>译文</span>
+                              <button
+                                type="button"
+                                className="story-msg-translation-copy"
+                                onClick={() => { void navigator.clipboard?.writeText(messageTranslations[message.id]); showVoiceNotice("译文已复制"); }}
+                              >复制</button>
+                            </div>
+                            <div className="story-msg-translation-body">{messageTranslations[message.id]}</div>
+                          </div>
+                        ) : null}
                         {activeMessageId === message.id && (() => {
                           const menu = (
                             <div
@@ -2156,6 +2209,15 @@ export function StoryApp({ onClose }: StoryAppProps) {
                             >
                               <div style={{ display: "flex" }}>
                                 <button onClick={() => handleStoryCopy(message.rawContent)} className="story-ctx-btn">复制</button>
+                                {(message.role === "assistant" || message.role === "user") && (
+                                  <button
+                                    onClick={() => { void handleStoryTranslate(message); }}
+                                    className="story-ctx-btn"
+                                    disabled={translatingMessageId === message.id}
+                                  >
+                                    {messageTranslations[message.id] ? "收起翻译" : translatingMessageId === message.id ? "翻译中…" : "翻译"}
+                                  </button>
+                                )}
                                 <button onClick={() => handleStoryEditStart(message)} className="story-ctx-btn">编辑</button>
                                 {(message.role === "assistant" || message.role === "user") && (
                                   <button onClick={() => { void handleStoryRetry(message.id); }} className="story-ctx-btn story-ctx-btn-danger">重试</button>

@@ -46,6 +46,49 @@
 .story-mini-phone-group-select select{min-width:0;flex:1;border:1px solid rgba(148,163,184,.22);border-radius:8px;padding:6px 8px;background:#fff;color:#334155}
 .story-mini-phone-group-empty{margin:0;padding:10px 12px;border-bottom:1px solid rgba(148,163,184,.16);font-size:11px;color:#b45309;background:#fffbeb}
 
+/* 剧情消息「翻译」：长按菜单翻译后在气泡下方展示的译文块（仅内存，不落库） */
+.story-msg-translation{
+  margin-top:6px;
+  padding:8px 11px;
+  border-radius:10px;
+  border:1px dashed rgba(148,163,184,.42);
+  background:var(--c-story-panel, rgba(148,163,184,.07));
+  color:var(--c-story-text, #3a3b3c);
+  font-size:calc(12.5px*var(--app-text-scale,1));
+  line-height:1.75;
+  white-space:pre-wrap;
+  overflow-wrap:anywhere;
+  user-select:text;
+  -webkit-user-select:text;
+  animation:story-translation-in .16s ease-out;
+}
+.story-msg-translation-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+  margin-bottom:3px;
+  color:var(--c-story-sub, #94a3b8);
+  font-size:calc(9.9px*var(--app-text-scale,1));
+  letter-spacing:.04em;
+  user-select:none;
+  -webkit-user-select:none;
+}
+.story-msg-translation-copy{
+  border:0;
+  background:none;
+  padding:0;
+  color:inherit;
+  font:inherit;
+  text-decoration:underline;
+  text-decoration-color:rgba(148,163,184,.34);
+  text-underline-offset:2px;
+  cursor:pointer;
+}
+.story-msg-translation-body{opacity:.94}
+@keyframes story-translation-in{from{opacity:0;transform:translateY(-2px)}to{opacity:1;transform:translateY(0)}}
+@media (prefers-reduced-motion: reduce){.story-msg-translation{animation:none}}
+
         /* 顶部/底部光晕点缀，制造空气感 */
         .story-app-shell::before {
           content: "";

@@ -3179,6 +3179,23 @@
   background: rgba(127, 144, 164, 0.08);
 }
 
+/* ── 长按悬浮菜单：条目多了不能横向溢出屏幕 ──
+   加了「翻译」后单行最多到 6 个按钮，窄屏（360~430px）会顶出视口左右边缘，
+   最左侧的「复制」被切掉一半（用户实报）。给菜单一个视口内宽度上限，
+   并允许每行内部换行——按钮仍从同一行开始，放不下折到下一行，不会丢项。 */
+.ctx-menu.chat-floating-ctx-menu {
+  /* 100% 相对菜单挂载的聊天室容器，而不是浏览器视口：
+     聊天室在虚拟手机壳里，壳通常比浏览器窄，用 vw 夹取等于没夹 */
+  max-width: calc(100% - 12px);
+  white-space: normal;
+}
+.ctx-menu.chat-floating-ctx-menu > .flex {
+  flex-wrap: wrap;
+  max-width: 100%;
+  justify-content: center;
+  row-gap: 0;
+}
+
 /* ── 长按菜单「翻译」气泡下方的译文（仅本地内存，不落库） ── */
 .chat-msg-translation {
   margin-top: 5px;

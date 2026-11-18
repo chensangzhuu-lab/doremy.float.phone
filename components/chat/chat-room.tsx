@@ -1398,12 +1398,17 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
     // 退出聊天室即清理；同一条再次点「翻译」即收起。
     const [messageTranslations, setMessageTranslations] = useState<Record<string, string>>({});
     const [messageTranslatingId, setMessageTranslatingId] = useState<string | null>(null);
-    const handleTranslateMessage = async (msg: ChatMessage) => {
+    // 译文按「源消息 id」存：投影拆分出的气泡 id 是临时值，多段共用一个源
+    const translateKeyOf = (msg: { id: string; displaySourceId?: string }): string => msg.displaySourceId || msg.id;
+    const handleTranslateMessage = async (msg: RenderChatMessage) => {
         setActiveMessageId(null);
-        if (messageTranslations[msg.id]) {
+        // 投影出来的拆分消息 id 是临时值（源 id__display_N），翻译按源消息计，
+        // 这样同一源的多段气泡共享一份译文，不会各翻一次
+        const key = translateKeyOf(msg);
+        if (messageTranslations[key]) {
             setMessageTranslations(prev => {
                 const next = { ...prev };
-                delete next[msg.id];
+                delete next[key];
                 return next;
             });
             return;
@@ -1414,13 +1419,13 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             return;
         }
         if (messageTranslatingId) return;
-        setMessageTranslatingId(msg.id);
+        setMessageTranslatingId(key);
         try {
             const result = await translateMessageText(text);
             if (result.content) {
-                setMessageTranslations(prev => ({ ...prev, [msg.id]: result.content as string }));
+                setMessageTranslations(prev => ({ ...prev, [key]: result.content as string }));
             } else {
-                showChatToast(result.error || "翻译失败，请重试", 3500);
+                showChatToast(result.error || "翻译失败，请重试", 4000);
             }
         } finally {
             setMessageTranslatingId(null);
@@ -5207,8 +5212,11 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
     }, [session.id, syncMessagesFromStorage]);
 
     /** Reusable context menu for user/assistant bubbles */
-    const renderBubbleContextMenu = (m: ChatMessage, options?: { allowMultiSelect?: boolean }) => {
+    const renderBubbleContextMenu = (m: RenderChatMessage, options?: { allowMultiSelect?: boolean }) => {
         const storedMessageId = getStoredActionMessageId(m);
+        // 投影出来的拆分消息 id 是「源 id__display_0」这样的临时值，翻的是同一个源消息，
+        // 因此译文状态一律按源 id 找；否则「收起翻译」永远判断不到已有译文
+        const translateKey = translateKeyOf(m);
         const menu = (
             <div
                 onPointerDown={e => e.stopPropagation()}
@@ -5216,7 +5224,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 style={getContextMenuInitialStyle()}
                 className="ctx-menu chat-floating-ctx-menu flex flex-col items-center gap-[6px] py-[4px] px-0"
                 data-role={m.role}>
-                <div className="flex">
+                <div className="flex flex-wrap justify-center">
                     <button onClick={() => {
                         const text = m.content;
                         const fallbackCopy = () => {
@@ -5236,15 +5244,6 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                         }
                         setActiveMessageId(null);
                     }} className="ctx-menu-btn">复制</button>
-                    {!m.mediaType || m.mediaType === "quote" || m.mediaType === "audio" ? (
-                        <button
-                            onClick={() => { void handleTranslateMessage(m); }}
-                            className="ctx-menu-btn"
-                            {...(messageTranslatingId === m.id ? { disabled: true } : {})}
-                        >
-                            {messageTranslations[m.id] ? "收起翻译" : messageTranslatingId === m.id ? "翻译中…" : "翻译"}
-                        </button>
-                    ) : null}
                     <button onClick={() => (m.role === "assistant" ? handleEditResponseStart(m) : handleEditMessageStart(m))} className="ctx-menu-btn">
                         {m.role === "assistant" && (m.rawResponseText || m.editableResponseText) ? "编辑回复" : "编辑"}
                     </button>
@@ -5264,8 +5263,17 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                         {m.mediaData?.callEndMarker ? "取消通话结尾" : "设为通话结尾"}
                     </button>
                 </div>
-                <div className="flex">
+                <div className="flex flex-wrap justify-center">
                     <button onClick={() => { setQuotingMessage(m); setActiveMessageId(null); }} className="ctx-menu-btn">引用</button>
+                    {!m.mediaType || m.mediaType === "quote" || m.mediaType === "audio" ? (
+                        <button
+                            onClick={() => { void handleTranslateMessage(m); }}
+                            className="ctx-menu-btn"
+                            {...(messageTranslatingId === translateKey ? { disabled: true } : {})}
+                        >
+                            {messageTranslations[translateKey] ? "收起翻译" : messageTranslatingId === translateKey ? "翻译中…" : "翻译"}
+                        </button>
+                    ) : null}
                     {options?.allowMultiSelect !== false && (
                         <button onClick={() => startMultiSelectFromMessage(m)} className="ctx-menu-btn">多选</button>
                     )}
@@ -6620,7 +6628,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                                 defaultTranslationExpanded={session.collapseBilingualTranslation !== false ? false : true}
                                             />
                                         </div>
-                                            {messageTranslations[msg.id] && (
+                                            {messageTranslations[translateKeyOf(msg)] && (
                                                 <div className="chat-msg-translation" onClick={(e) => e.stopPropagation()}>
                                                     <div className="chat-msg-translation-head">
                                                         <span>译文</span>
@@ -6628,13 +6636,13 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                                             type="button"
                                                             className="chat-msg-translation-copy"
                                                             onClick={() => {
-                                                                const text = messageTranslations[msg.id];
+                                                                const text = messageTranslations[translateKeyOf(msg)];
                                                                 copyTextToClipboard(text);
                                                                 showChatToast("译文已复制");
                                                             }}
                                                         >复制</button>
                                                     </div>
-                                                    <div className="chat-msg-translation-body">{messageTranslations[msg.id]}</div>
+                                                    <div className="chat-msg-translation-body">{messageTranslations[translateKeyOf(msg)]}</div>
                                                 </div>
                                             )}
                                         </div>}

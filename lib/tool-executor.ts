@@ -19,11 +19,16 @@ import {
     saveRestTools,
     saveRestToolPackages,
     expandToolNameMacros,
+    getEnabledTools,
     toolNameMatches,
 } from "./tool-storage";
 import { executeCustomAppToolCall } from "./custom-app-tool-runtime";
+import { executeLifeToolCall, isLifeToolName } from "./life/life-tools";
+import { appendLifeTimelineEntry, loadVirtualLifeState, saveVirtualLifeState } from "./life/life-storage";
 import { characterWorkspace, agentComputerRequest, isAgentComputerConfigured } from "./agent-computer";
-import { AGENT_COMPUTER_CAPABILITY_ID, CHECK_IN_REQUEST_CAPABILITY_ID, CALENDAR_MANAGEMENT_CAPABILITY_ID, DEVICE_ACTION_CAPABILITY_ID, LOCAL_DATA_LIBRARY_CAPABILITY_ID, MEMORY_WRITE_CAPABILITY_ID, MUSIC_CONTROL_CAPABILITY_ID, NOTE_WALL_CAPABILITY_ID, PERCEPTION_READ_CAPABILITY_ID, PHONE_WIDGET_CAPABILITY_ID, REALITY_BRIDGE_CAPABILITY_ID, SEND_FILE_CAPABILITY_ID, SYSTEM_CALENDAR_CAPABILITY_ID, TIMED_WAKE_CAPABILITY_ID, TOOLBOX_MANAGEMENT_CAPABILITY_ID, getInternalCapability } from "./internal-capability-storage";
+import { CHARACTER_ECONOMY_CAPABILITY_ID, ANONYMOUS_QA_CAPABILITY_ID, CHARACTER_APP_LOCK_CAPABILITY_ID, MEMO_CAPABILITY_ID, AGENT_COMPUTER_CAPABILITY_ID, CHECK_IN_REQUEST_CAPABILITY_ID, CALENDAR_MANAGEMENT_CAPABILITY_ID, DEVICE_ACTION_CAPABILITY_ID, LOCAL_DATA_LIBRARY_CAPABILITY_ID, MEMORY_WRITE_CAPABILITY_ID, MUSIC_CONTROL_CAPABILITY_ID, NOTE_WALL_CAPABILITY_ID, PHOTO_WALL_CAPABILITY_ID, PERCEPTION_READ_CAPABILITY_ID, PHONE_WIDGET_CAPABILITY_ID, REALITY_BRIDGE_CAPABILITY_ID, SEND_FILE_CAPABILITY_ID, SYSTEM_CALENDAR_CAPABILITY_ID, TIMED_WAKE_CAPABILITY_ID, TOOLBOX_MANAGEMENT_CAPABILITY_ID, getInternalCapability, getInternalCapabilitySubToolDefinitions } from "./internal-capability-storage";
+import { createPhotoWallId, loadPhotoWallState, savePhotoWallState, type PhotoWallDoodle, type PhotoWallCreationRecord, type PhotoWallPhoto } from "./photo-wall-storage";
+import { generateImageFromConfiguredApi } from "./image-generation-service";
 import {
     checkQueryCooldown,
     describeStatusByFocus,
@@ -33,10 +38,12 @@ import {
     loadPerceptionStatus,
     markQueryPerformed,
 } from "./perception";
-import { notifyDeviceAction, runDeviceAction } from "./device-action";
-import { renderWidgetHtml } from "./widget/template";
+import { notifyDeviceAction, runDeviceAction, listInstalledApps, appLockStart, appLockStop, appLockTemporaryPass, appLockStatus, appLockReveal } from "./device-action";
+import { renderWidgetHtml, injectWidgetCss } from "./widget/template";
 import { canGenerateAvatar, generateWidgetAvatar } from "./widget/avatar";
-import { loadWidgetConfig, saveWidgetData, loadWidgetData } from "./widget/storage";
+import { loadWidgetConfig, saveWidgetData, loadWidgetData, loadWidgetProfiles, loadWidgetProfileData, saveWidgetProfileData } from "./widget/storage";
+import { pushWidgetProfileHtml } from "./widget/bridge";
+import type { WidgetData } from "./widget/types";
 import { syncWidgetToNative } from "./widget/bridge";
 import {
     formatEventTime,
@@ -52,6 +59,15 @@ import { createShortcutCommand, deliverShortcutCommand, waitForShortcutCommand }
 import { loadMemoryEntriesByType, saveMemoryEntry } from "./memory-storage";
 import type { MemoryEntry } from "./memory-types";
 import { loadCharacters } from "./character-storage";
+import { characterEarn, characterSpend, ensureCharacterLedger, loadCharacterLedger } from "./economy/character-ledger";
+import { createFamilyCardForCharacter, loadFamilyCards, spendWithFamilyCard } from "./economy/family-card";
+import { answerAnonymousQuestion, askAnonymousQuestion, loadAnonymousQa } from "./anonymous-qa";
+import { depositToJointFund, loadJointFundTransactions, loadJointFunds, setJointFundPlanForCharacter } from "./economy/joint-fund";
+import { recordWalletBookkeeping } from "./wallet-storage";
+import { createOrGetSession, loadChatMessages, loadChatSessions, resolveSessionCharacterId } from "./chat-storage";
+import { readCustomAppCollection } from "./custom-app-storage";
+import { FOCUS_COMPANION_APP_ID } from "./builtin-apps/focus-companion-meta";
+import { makeNativeToolName } from "./native-tool-name";
 import {
     deleteCalendarScheduleItem,
     loadCalendarWeekPlan,
@@ -259,6 +275,36 @@ async function proxyFetch(
     }
 }
 
+export async function testBuiltinSearchConnection(
+    provider: "deepseek" | "tavily",
+    apiKey: string,
+): Promise<{ resultCount: number; message: string }> {
+    const key = apiKey.trim();
+    if (!key) throw new Error("请先填写 API Key。");
+    const url = provider === "deepseek" ? "https://api.deepseek.com/v1/tools/search" : "https://api.tavily.com/search";
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const body = provider === "deepseek"
+        ? { query: "OpenAI", count: 1, need_content: false }
+        : { api_key: key, query: "OpenAI", search_depth: "basic", max_results: 1, include_answer: false };
+    if (provider === "deepseek") headers.Authorization = "Bearer " + key;
+    const response = await proxyFetch(url, { method: "POST", headers, body, timeoutMs: 20000 });
+    let payload: Record<string, unknown> = {};
+    try { payload = JSON.parse(response.text) as Record<string, unknown>; }
+    catch {
+        if (response.status < 200 || response.status >= 300) throw new Error("接口返回 HTTP " + response.status + "：" + response.text.slice(0, 240));
+        throw new Error("接口返回了无法识别的数据，请检查代理或服务商接口。");
+    }
+    if (response.status < 200 || response.status >= 300) {
+        const error = payload.error;
+        const detail = typeof error === "string" ? error : error && typeof error === "object" && "message" in error
+            ? String((error as { message?: unknown }).message || JSON.stringify(error))
+            : String(payload.message || payload.detail || response.text);
+        throw new Error("HTTP " + response.status + "：" + detail.slice(0, 240));
+    }
+    const results = Array.isArray(payload.results) ? payload.results : [];
+    return { resultCount: results.length, message: results.length ? "连接成功，已返回 " + results.length + " 条搜索结果。" : "接口连接成功，但测试关键词没有返回结果。" };
+}
+
 // 直连模式：浏览器直接请求 MCP（本机/局域网地址服务端代理天然不可达且被 SSRF 防线拦截）。
 // 需要 MCP 服务器允许 CORS；仅支持 Streamable HTTP（POST）。
 async function directMcpFetch(
@@ -463,7 +509,52 @@ export function parseToolCalls(text: string): { cleanText: string; toolCalls: To
 
 export async function executeToolCalls(toolCalls: ToolCall[], context?: ToolExecutionContext): Promise<ToolResult[]> {
     throwIfAborted(context?.signal);
-    return Promise.all(toolCalls.map(call => executeSingleToolCall(call, context, { depth: 0 })));
+    // Life tools read and write one shared snapshot. Serialize those calls to prevent
+    // concurrent invitations/schedule changes from overwriting one another, while keeping
+    // independent non-life tools parallel. Results stay aligned with the model's call order.
+    const results = new Array<ToolResult>(toolCalls.length);
+    const independentCalls = toolCalls
+        .map((call, index) => ({ call, index }))
+        .filter(item => !isLifeToolName(item.call.name));
+    await Promise.all(independentCalls.map(async ({ call, index }) => {
+        throwIfAborted(context?.signal);
+        results[index] = await executeSingleToolCall(call, context, { depth: 0 });
+    }));
+    for (let index = 0; index < toolCalls.length; index++) {
+        const call = toolCalls[index];
+        if (!isLifeToolName(call.name)) continue;
+        throwIfAborted(context?.signal);
+        results[index] = await executeSingleToolCall(call, context, { depth: 0 });
+    }
+    if ((context?.appId === "chat" || context?.appId === "group_chat") && context.characterId && typeof window !== "undefined") {
+        try {
+            let life = loadVirtualLifeState();
+            if (life.settings.enabled) {
+                const characterName = loadCharacters().find(character => character.id === context.characterId)?.name ?? "角色";
+                let changed = false;
+                for (let index = 0; index < toolCalls.length; index++) {
+                    const call = toolCalls[index];
+                    if (isLifeToolName(call.name)) continue; // Life tools record their own richer event.
+                    const result = results[index];
+                    const detail = result?.success === false
+                        ? "调用未成功：" + (result.error || "工具返回失败")
+                        : "角色在消息互动中执行了该工具。";
+                    life = appendLifeTimelineEntry(life, {
+                        category: "tool",
+                        title: characterName + "调用了" + call.name + "工具",
+                        details: detail,
+                        actorId: context.characterId,
+                        actorName: characterName,
+                    });
+                    changed = true;
+                }
+                if (changed) saveVirtualLifeState(life);
+            }
+        } catch {
+            // Tool execution must not fail because optional Life timeline logging failed.
+        }
+    }
+    return results;
 }
 
 type ToolExecutionHint = {
@@ -486,12 +577,104 @@ function buildToolNameMacroContext(context?: ToolExecutionContext) {
     return { characterName, userName };
 }
 
+/**
+ * Recover native provider names when they leak across a text-protocol or persisted
+ * reality-bridge boundary. The registry is rebuilt from the same enabled-tool
+ * snapshot and registration order used by buildNativeChatTools; no suffix stripping
+ * or guessed tool-name matching is allowed.
+ */
+function resolveNativeToolCall(call: ToolCall, context?: ToolExecutionContext): ToolCall {
+    const requested = call.name.trim();
+    if (!/^action_?[a-z0-9]{1,16}$/i.test(requested)) return call;
+
+    const enabledTools = getEnabledTools(context?.appId ?? "chat");
+    if (enabledTools.length === 0) return call;
+    const macroContext = buildToolNameMacroContext(context);
+    const expandedSourceIds = new Set(
+        context?.sessionId
+            ? loadChatSessions().find(session => session.id === context.sessionId)?.nativeExpandedToolSourceIds || []
+            : [],
+    );
+    const usedNames = new Set<string>();
+    const aliases = new Map<string, string>();
+
+    const expandedName = (name: string) => expandToolNameMacros(name, macroContext);
+    const register = (displayName: string, canonicalName: string) => {
+        const nativeName = makeNativeToolName(expandedName(displayName), usedNames);
+        aliases.set(nativeName, canonicalName);
+    };
+    const reserveLoader = (sourceKey: string, displayName: string) => {
+        makeNativeToolName(`load_${sourceKey}_${expandedName(displayName)}_tools`, usedNames);
+    };
+    const sourceKey = (tool: { source: string; sourceId: string }) => `${tool.source}:${tool.sourceId}`;
+
+    // First pass mirrors the initial native-tool registration order, including loader
+    // names because they participate in collision suffix allocation.
+    for (const tool of enabledTools) {
+        const capability = tool.source === "internal" ? getInternalCapability(tool.sourceId) : undefined;
+        const subTools = capability ? getInternalCapabilitySubToolDefinitions(capability) : [];
+        const isSingle = tool.source === "life"
+            || tool.source === "rest"
+            || tool.source === "composite"
+            || tool.source === "custom_app"
+            || (tool.source === "internal" && subTools.length === 0);
+        if (isSingle) {
+            register(tool.name, tool.name);
+        } else {
+            reserveLoader(sourceKey(tool), tool.name);
+        }
+    }
+
+    // Second pass mirrors expanded package/sub-tool registration. Only packages
+    // actually expanded in this chat session contribute names and collision suffixes.
+    for (const tool of enabledTools) {
+        const key = sourceKey(tool);
+        if (tool.source === "rest_package" && expandedSourceIds.has(key)) {
+            for (const child of tool.restTools || []) register(child.name, child.name);
+        } else if (tool.source === "composite_package" && expandedSourceIds.has(key)) {
+            for (const child of tool.compositeTools || []) register(child.name, child.name);
+        } else if (tool.source === "mcp_server" && expandedSourceIds.has(key)) {
+            for (const child of tool.mcpTools || []) register(child.name, child.name);
+        } else if (tool.source === "custom_app_package" && expandedSourceIds.has(key)) {
+            for (const child of tool.customAppTools || []) register(child.name, child.name);
+        } else if (tool.source === "internal") {
+            const capability = getInternalCapability(tool.sourceId);
+            const subTools = capability ? getInternalCapabilitySubToolDefinitions(capability) : [];
+            for (const child of subTools) register(child.name, child.name);
+        }
+    }
+
+    const exact = aliases.get(requested) || aliases.get(requested.toLowerCase());
+    if (exact) return { ...call, name: exact };
+
+    // Some providers strip underscores from function names. Accept that variant only
+    // when it identifies exactly one registered native name; never remove collision
+    // suffixes or guess between multiple tools.
+    const compact = requested.toLowerCase().replace(/_/g, "");
+    const matches = [...aliases.entries()]
+        .filter(([nativeName]) => nativeName.toLowerCase().replace(/_/g, "") === compact)
+        .map(([, canonicalName]) => canonicalName);
+    const uniqueMatches = [...new Set(matches)];
+    return uniqueMatches.length === 1 ? { ...call, name: uniqueMatches[0] } : call;
+}
+
+/**
+ * 把模型泄漏到文本协议里的原生名（action_xxxx）解析回中文显示名。
+ * 仅用于「正在…」这类状态文案；解析不到时原样返回，不改变执行链。
+ */
+export function resolveToolCallDisplayName(name: string, context?: ToolExecutionContext): string {
+    const requested = String(name || "").trim();
+    if (!requested) return name;
+    return resolveNativeToolCall({ name: requested, args: {} }, context).name || requested;
+}
+
 async function executeSingleToolCall(
     call: ToolCall,
     context: ToolExecutionContext | undefined,
     hint: ToolExecutionHint,
 ): Promise<ToolResult> {
     throwIfAborted(context?.signal);
+    call = resolveNativeToolCall(call, context);
     const preferredType = hint.toolType && hint.toolType !== "auto" && hint.toolType !== "script" ? hint.toolType : undefined;
     const restTools = loadRestTools();
     const restPackages = loadRestToolPackages();
@@ -542,6 +725,12 @@ async function executeSingleToolCall(
         return null;
     };
     const tryCustomApp = () => executeCustomAppToolCall(call, context, nameMacroContext);
+    const tryLife = () => executeLifeToolCall(call, context);
+
+    // 生活工具现在对外用中文名（内部 ID 仍是 life_*），不能再靠前缀判断。
+    // executeLifeToolCall 对非生活工具会立即返回 null，所以这里可以安全地先试。
+    const lifeResult = await tryLife();
+    if (lifeResult) return lifeResult;
 
     if (preferredType === "internal") {
         const result = await tryInternal();
@@ -806,7 +995,12 @@ function normalizeInternalToolResult(result: ToolResult): ToolResult {
 }
 
 async function executeInternalTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult | null> {
+    if (["翻看备忘录","阅读备忘录","新建备忘录","修改备忘录","整理待办","整理档案盒","翻阅归档","删除备忘录","完成备忘录维护"].includes(call.name)) return executeMemoTool(call, context);
+    if (isCharacterEconomyToolName(call.name)) return executeCharacterEconomyTool(call, context);
+    if (isAnonymousQaToolName(call.name)) return executeAnonymousQaTool(call, context);
+    if (isAppLockToolName(call.name)) return executeAppLockTool(call, context);
     if (isNoteWallToolName(call.name)) return executeNoteWallTool(call, context);
+    if (isPhotoWallToolName(call.name)) return executePhotoWallTool(call, context);
     if (isMusicControlToolName(call.name)) return executeMusicControlTool(call, context);
     if (isCalendarToolName(call.name)) return executeCalendarTool(call, context);
     if (isLocalDataToolName(call.name)) return executeLocalDataTool(call);
@@ -841,6 +1035,83 @@ async function executeInternalTool(call: ToolCall, context?: ToolExecutionContex
     }
 
     return executeMemoryWriteTool(call.args, capability, context);
+}
+
+async function executeMemoTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
+    const capability = getInternalCapability(MEMO_CAPABILITY_ID);
+    if (!capability || !capability.enabled || capability.mode === "off") return { name: call.name, success: false, error: "备忘录能力未启用" };
+    if (context?.appId !== "chat" || !context.characterId) return { name: call.name, success: false, error: "备忘录工具仅允许在一对一私聊中使用" };
+    const owner = { type: "character" as const, id: context.characterId };
+    try {
+        const memo = await import("./memo-archive-storage");
+        const own = await memo.loadMemoArchive(owner, "all");
+        const shared = await memo.readSharedMemoNotes(context.characterId);
+        const all = [...own.notes.filter(n => !n.deletedAt && !n.archived), ...shared.filter(n => !n.archived)];
+        const noteId = String(call.args?.noteId ?? "");
+        if (call.name === "翻看备忘录") {
+            const q = String(call.args?.query ?? "").trim().toLowerCase();
+            const limit = Math.max(1, Math.min(30, Number(call.args?.limit) || 12));
+            const rows = all.filter(n => !q || (n.title + n.body + n.tags.join(" ")).toLowerCase().includes(q)).slice(0, limit);
+            return { name: call.name, success: true, data: rows.length ? rows.map(n => `noteId=${n.id}；标题=${n.title}；摘要=${n.body.slice(0,100)}；标签=${n.tags.join("、")}；来源=${n.owner.type==="user"?"用户分享（只读）":"我的档案"}`).join("\n") : "没有找到相关备忘录。" };
+        }
+        if (call.name === "阅读备忘录") {
+            const n = all.find(x => x.id === noteId); if (!n) return { name: call.name, success: false, error: "备忘录不存在或未向你分享" };
+            return { name: call.name, success: true, data: `标题：${n.title}\n正文：\n${n.body}\n待办：\n${n.todos.map(t=>(t.done?"[x] ":"[ ] ")+t.text).join("\n")}` };
+        }
+        if (call.name === "新建备忘录") {
+            const title = String(call.args?.title ?? "").trim(), body = String(call.args?.body ?? "");
+            if (!title || !body) return { name: call.name, success: false, error: "新建备忘录需要 title 和 body" };
+            const duplicate = own.notes.find(n => !n.deletedAt && n.title.trim().toLowerCase() === title.toLowerCase());
+            if (duplicate) return { name: call.name, success: false, error: `已存在同名备忘录 noteId=${duplicate.id}，请先阅读或修改，不要重复创建。` };
+            const n = await memo.saveMemoNote(owner, { title, body, tags: Array.isArray(call.args?.tags) ? call.args.tags.map(String) : [] });
+            return { name: call.name, success: true, data: `已创建备忘录：${n.title}（noteId=${n.id}）` };
+        }
+        if (call.name === "修改备忘录") {
+            const n = own.notes.find(x => x.id === noteId && !x.deletedAt); if (!n) return { name: call.name, success: false, error: "只能修改自己的备忘录；用户分享内容只读。" };
+            const nextBody = call.args?.body === undefined ? n.body : call.args?.append === true ? n.body + "\n" + String(call.args.body) : String(call.args.body);
+            const updated = await memo.saveMemoNote(owner, { ...n, title: call.args?.title === undefined ? n.title : String(call.args.title), body: nextBody });
+            return { name: call.name, success: true, data: `已更新：${updated.title}` };
+        }
+        if (call.name === "整理待办") {
+            if (call.args?.items !== undefined || call.args?.text) {
+                const rawItems = Array.isArray(call.args?.items) ? call.args.items : [call.args?.text];
+                const items = rawItems.map((item: unknown) => typeof item === "string" ? item : item && typeof item === "object" ? String((item as {text?:unknown}).text ?? "") : "").filter((item: string) => item.trim());
+                if (!items.length) return { name: call.name, success: false, error: "items 至少需要包含一条有效 text" };
+                const result = await memo.appendMemoTodos(owner, noteId || undefined, items);
+                return { name: call.name, success: true, data: `已批量整理待办，当前共 ${result.count} 项。新增事项已追加，原有事项不会被覆盖。` };
+            }
+            const n = own.notes.find(x => x.id === noteId && !x.deletedAt); if (!n) return { name: call.name, success: false, error: "更新已有待办时需要有效 noteId。" };
+            const todos = call.args?.todoId ? n.todos.map(t => t.id === call.args.todoId ? { ...t, done: call.args?.done !== false, completedAt: call.args?.done === false ? undefined : Date.now() } : t) : n.todos;
+            await memo.saveMemoNote(owner, { ...n, todos });
+            return { name: call.name, success: true, data: `待办已更新。未完成 ${todos.filter(t=>!t.done).length} 项。` };
+        }
+        if (call.name === "整理档案盒") {
+            if (call.args?.action === "rename" && call.args?.folderId) {
+                await memo.updateMemoFolder(String(call.args.folderId), owner, { name: String(call.args.name ?? "") });
+                return { name: call.name, success: true, data: "档案盒已重命名。" };
+            }
+            const folder = await memo.createMemoFolder(owner, String(call.args?.name ?? ""));
+            return { name: call.name, success: true, data: `已创建档案盒 ${folder.name}（folderId=${folder.id}）` };
+        }
+        if (call.name === "翻阅归档") {
+            const rows = own.notes.filter(n => n.archived && !n.deletedAt).slice(0, Math.max(1, Math.min(30, Number(call.args?.limit)||12)));
+            return { name: call.name, success: true, data: rows.map(n=>`noteId=${n.id}；${n.title}；${n.body.slice(0,100)}`).join("\n") || "暂无归档内容。" };
+        }
+        if (call.name === "完成备忘录维护") {
+            const ids = Array.isArray(call.args?.reviewedNoteIds) ? call.args.reviewedNoteIds.map(String) : [];
+            const summary = String(call.args?.summary ?? "");
+            const changes = Array.isArray(call.args?.changes) ? call.args.changes.map(String) : [];
+            const record = await memo.recordMemoMaintenanceResult(context.characterId, ids, summary, changes);
+            return { name: call.name, success: true, data: `维护结果已保存：检查 ${record.reviewedNoteIds.length} 条手记，${record.changes.length ? "实际变更 " + record.changes.length + " 项" : "无需修改"}。未检查的手记仍保留待维护状态。` };
+        }
+        if (call.name === "删除备忘录") {
+            await memo.moveMemoToRecycleBin(noteId, owner);
+            return { name: call.name, success: true, data: "已移入回收站，可在私人档案室恢复或永久删除。" };
+        }
+        return { name: call.name, success: false, error: "未知备忘录动作" };
+    } catch (error) {
+        return { name: call.name, success: false, error: error instanceof Error ? error.message : String(error) };
+    }
 }
 
 /**
@@ -918,45 +1189,88 @@ async function executePhoneWidgetTool(call: ToolCall, context?: ToolExecutionCon
         };
     }
 
-    const text = String(call.args?.text ?? "").trim().slice(0, 300);
-    if (!text) return { name: call.name, success: false, error: "需要 text 参数" };
-    const status = String(call.args?.status ?? "").trim().slice(0, 30);
+    // 参数健壮化：模型偶尔会把 text 包进代码围栏/引号，或用 content/message 传参——
+    // 都接住并清理，不要一遇到就「需要 text 参数」报错。
+    const rawText = String(call.args?.text ?? call.args?.content ?? call.args?.message ?? "");
+    const text = rawText
+        .replace(/^```(?:json|text|markdown)?\s*/i, "")
+        .replace(/```\s*$/i, "")
+        .trim()
+        .replace(/^["「『“]|["」』”]$/g, "")
+        .slice(0, 300);
+    if (!text) return { name: call.name, success: false, error: "需要 text 参数：要留在桌面上的那句话（60 字内效果最好）" };
+    const status = String(call.args?.status ?? "").replace(/^["「『“]|["」』”]$/g, "").trim().slice(0, 30);
+    // 可选：指定写入哪个桌面实例（设置 → 桌面小组件里创建的独立配置）。
+    // 不传时写默认实例——多实例用户可以让不同小组件显示不同角色/不同内容。
+    const profileId = String(call.args?.profileId ?? call.args?.instance ?? "").trim();
 
     const character = loadCharacters().find(item => item.id === context.characterId);
     const userName = resolveUserIdentity(context.characterId, context.appId)?.name || "用户";
 
     // 配了生图且用户开了开关时，顺带换一张配当前状态的头像。
     // 失败/没配都静默沿用旧头像——不能因为头像让「留话」整体失败。
-    let avatar = loadWidgetData()?.avatar ?? "";
+    const previousData = profileId ? loadWidgetProfileData(profileId) ?? loadWidgetData() : loadWidgetData();
+    let avatar = previousData?.avatar ?? "";
     if (config.useGeneratedAvatar && canGenerateAvatar() && character) {
         const generated = await generateWidgetAvatar(character, status, text, context.signal);
         if (generated) avatar = generated;
     }
 
-    saveWidgetData({
+    const widgetData: WidgetData = {
         characterId: context.characterId,
         text,
         status,
         avatar,
         updatedAt: new Date().toISOString(),
         source: "tool",
-    });
-
-    // 立刻推给桌面。没装壳/老壳时这一步失败也无所谓——
-    // 内容已经存下了，用户下次打开设置页会看到，装壳后自然同步过去。
-    try {
-        const html = renderWidgetHtml(config.customTemplate, loadWidgetData()!, character?.name ?? "角色", userName);
-        syncWidgetToNative(html);
-    } catch (err) {
-        console.warn("[Widget] 推送原生失败", err);
-    }
-
-    return {
-        name: call.name,
-        success: true,
-        data: `已在 TA 的桌面上留下：「${text}」${status ? `（状态：${status}）` : ""}`,
-        userNotice: "在桌面上留了句话",
     };
+
+    try {
+        if (profileId) {
+            const profile = loadWidgetProfiles().find(item => item.id === profileId);
+            if (!profile) {
+                return { name: call.name, success: false, error: `没有找到桌面实例 ${profileId}；可在设置 → 桌面小组件查看已有实例 ID` };
+            }
+            saveWidgetProfileData(profileId, widgetData);
+            const html = injectWidgetCss(
+                renderWidgetHtml(profile.template, loadWidgetProfileData(profileId)!, character?.name ?? "角色", userName),
+                profile.customCss,
+            );
+            const pushed = pushWidgetProfileHtml(profileId, html, { widthDp: profile.widthDp, heightDp: profile.heightDp, scale: profile.scale });
+            if (!pushed) console.warn("[Widget] 推送独立实例失败（可能是旧壳），内容已保存");
+            return {
+                name: call.name,
+                success: true,
+                data: pushed
+                    ? "已在桌面实例「" + profile.name + "」留下：「" + text + "」" + (status ? "（状态：" + status + "）" : "")
+                    : "内容已保存到桌面实例「" + profile.name + "」，但原生桌面未确认刷新；请检查小组件壳版本或重新打开设置页同步。",
+                userNotice: pushed ? "已在桌面实例上留了句话" : "留言已保存，但桌面尚未确认刷新",
+            };
+        }
+
+        saveWidgetData(widgetData);
+
+        // 立刻推给桌面。没装壳/老壳时这一步失败也无所谓——
+        // 内容已经存下了，用户下次打开设置页会看到，装壳后自然同步过去。
+        let pushed = false;
+        try {
+            const html = renderWidgetHtml(config.customTemplate, loadWidgetData()!, character?.name ?? "角色", userName);
+            pushed = syncWidgetToNative(html);
+        } catch (err) {
+            console.warn("[Widget] 推送原生失败", err);
+        }
+
+        return {
+            name: call.name,
+            success: true,
+            data: pushed
+                ? "已在 TA 的桌面上留下：「" + text + "」" + (status ? "（状态：" + status + "）" : "")
+                : "内容已保存，但原生桌面未确认刷新；请检查小组件是否已添加、安卓壳版本是否支持，并重新打开设置页同步。",
+            userNotice: pushed ? "已在桌面上留了句话" : "留言已保存，但桌面尚未确认刷新",
+        };
+    } catch (err) {
+        return { name: call.name, success: false, error: err instanceof Error ? err.message : "桌面留话失败" };
+    }
 }
 
 /** 角色查看用户真实手机的系统日历（只读，且只读摘要字段）。 */
@@ -1439,6 +1753,10 @@ function isNoteWallToolName(name: string): boolean {
         || name === "查看便签详情及评论"
         || name === "发送便签"
         || name === "发送便签评论";
+}
+
+function isPhotoWallToolName(name: string): boolean {
+    return name === "查看照片墙" || name === "添加照片到照片墙" || name === "在照片墙涂鸦";
 }
 
 function isMusicControlToolName(name: string): boolean {
@@ -2202,6 +2520,345 @@ async function executeToolboxManagementTool(call: ToolCall): Promise<ToolResult>
     }
 }
 
+function isAppLockToolName(name: string): boolean {
+    return name === "查看可锁应用" || name === "锁应用" || name === "解锁应用" || name === "查看应用锁" || name === "告诉应用锁密码" || name === "给临时通行证";
+}
+
+/** 好感度阈值优先读专注 APP 的角色应用限制设置；没装/没设置时用默认 60。 */
+function focusAppLockThreshold(): number {
+    try {
+        const rows = readCustomAppCollection(FOCUS_COMPANION_APP_ID, "settings");
+        const row = rows[rows.length - 1];
+        const data = row && typeof row.data === "object" && row.data ? row.data as Record<string, unknown> : {};
+        const rule = data.appLock && typeof data.appLock === "object" ? data.appLock as Record<string, unknown> : {};
+        const value = Number(rule.threshold ?? data.appLockThreshold ?? 60);
+        return Number.isFinite(value) ? Math.max(0, Math.min(100, value)) : 60;
+    } catch {
+        return 60;
+    }
+}
+
+/** 锁屏返回时始终定位到发起角色的私聊，不把群聊当作角色的求情入口。 */
+function resolveAppLockChatSessionId(characterId: string): string {
+    try {
+        const existing = loadChatSessions()
+            .filter(session => !session.isGroup && (session.characterId === characterId || session.contactId === characterId))
+            .slice()
+            .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))[0];
+        return existing?.id || createOrGetSession(characterId).id;
+    } catch {
+        return "";
+    }
+}
+
+/** 从该角色最近的私聊消息里读 [好感度:N]；专注 APP 的应用限制使用同一套判定。 */
+function latestCharacterAffinity(characterId: string): number {
+    try {
+        const sessions = loadChatSessions()
+            .filter(session => !session.isGroup && (session.characterId === characterId || session.contactId === characterId))
+            .slice()
+            .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+        for (const session of sessions) {
+            const messages = loadChatMessages(session.id).slice(-80);
+            for (let index = messages.length - 1; index >= 0; index -= 1) {
+                const message = messages[index];
+                if (message.role !== "assistant") continue;
+                const stateValue = (message.stateValues || []).find(item => String(item.name || "").includes("好感度"));
+                if (stateValue && Number.isFinite(Number(stateValue.value))) {
+                    return Math.max(0, Math.min(100, Number(stateValue.value)));
+                }
+                const match = String(message.content || "").match(/\[好感度[:：]\s*(\d{1,3})\]/);
+                if (match) return Math.max(0, Math.min(100, Number(match[1]) || 0));
+            }
+        }
+    } catch { /* 读不到就按 0 处理，宁可不给密码 */ }
+    return 0;
+}
+
+async function executeAppLockTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
+    const capability = getInternalCapability(CHARACTER_APP_LOCK_CAPABILITY_ID);
+    if (!capability || !capability.enabled || capability.mode === "off") {
+        return { name: call.name, success: false, error: "角色锁应用能力未启用", continueConversation: false, persistToHistory: false, userNotice: "角色锁应用能力未启用" };
+    }
+    const characterId = context?.characterId;
+    if (!characterId) return { name: call.name, success: false, error: "缺少角色上下文", continueConversation: false, persistToHistory: false };
+    const character = loadCharacters().find(c => c.id === characterId);
+    try {
+        if (call.name === "查看可锁应用") {
+            const result = listInstalledApps();
+            if (!result.ok) throw new Error(result.reason || "读不到应用列表");
+            return { name: call.name, success: true, data: result.apps.slice(0, 100).map(a => `${a.label} (${a.package})`).join("\n"), userNotice: "看了看可以锁的应用" };
+        }
+        if (call.name === "给临时通行证") {
+            const status = appLockStatus();
+            if (!status.ok || !status.running) throw new Error("现在没有应用锁在生效");
+            if (status.charId !== characterId) throw new Error("这不是你发起的应用锁，不能替别人发通行证");
+            const minutes = Math.max(1, Math.min(5, Number(call.args?.minutes) || 1));
+            const result = appLockTemporaryPass(minutes);
+            if (!result.ok) throw new Error(result.reason || "临时通行证发放失败");
+            return { name: call.name, success: true, data: `已给用户 ${minutes} 分钟临时通行时间，到期后会自动恢复拦截。`, userNotice: `${character?.name || "TA"} 给了你 ${minutes} 分钟通行时间` };
+        }
+        if (call.name === "解锁应用") {
+            const status = appLockStatus();
+            if (!status.ok || !status.running) throw new Error("现在没有应用锁在生效");
+            if (status.charId !== characterId) throw new Error("这不是你发起的应用锁，不能替别人解除");
+            const result = appLockStop();
+            if (!result.ok) throw new Error(result.reason || "解锁失败");
+            return { name: call.name, success: true, data: "已解除当前应用锁", userNotice: "把应用锁解除了" };
+        }
+        if (call.name === "查看应用锁") {
+            const status = appLockStatus();
+            if (!status.ok) return { name: call.name, success: true, data: "当前没有应用锁", userNotice: "没有应用锁" };
+            if (!status.running) return { name: call.name, success: true, data: "当前没有应用锁", userNotice: "没有应用锁" };
+            const monitorNote = status.monitoringAvailable === false
+                ? "；但前台应用监测权限不可用，自动拦截可能失效，请检查使用情况访问或无障碍服务"
+                : "";
+            return { name: call.name, success: true, data: `正在锁：${status.label || status.target}${monitorNote}`, userNotice: "看了一眼应用锁" };
+        }
+        if (call.name === "告诉应用锁密码") {
+            const status = appLockStatus();
+            if (!status.ok || !status.running) throw new Error("现在没有应用锁在生效");
+            if (status.charId !== characterId) throw new Error("这个应用锁不是你下的");
+            const threshold = focusAppLockThreshold();
+            const score = latestCharacterAffinity(characterId);
+            if (score < threshold) {
+                return {
+                    name: call.name,
+                    success: true,
+                    data: `当前好感度 ${score}，低于告诉密码需要的 ${threshold}，暂时不能告知密码。`,
+                    userNotice: "TA 现在还不肯告诉你密码",
+                };
+            }
+            const revealed = appLockReveal();
+            if (!revealed.ok || !revealed.password) throw new Error(revealed.reason || "密码读取失败");
+            return {
+                name: call.name,
+                success: true,
+                data: `密码是 ${revealed.password}。只在私聊里告诉用户，不要公开，也不要在锁页/设置里展示。`,
+                userNotice: "TA 把密码悄悄告诉你了",
+                persistToHistory: false,
+            };
+        }
+        const wanted = String(call.args?.app || "").trim();
+        if (!wanted) throw new Error("需要 app（应用名或包名）");
+        const apps = listInstalledApps();
+        if (!apps.ok) throw new Error(apps.reason || "读不到应用列表");
+        const norm = (v: string) => v.trim().toLowerCase();
+        const app = apps.apps.find(a => norm(a.package) === norm(wanted))
+            || apps.apps.find(a => norm(a.label) === norm(wanted))
+            || apps.apps.find(a => norm(a.label).includes(norm(wanted)) || norm(wanted).includes(norm(a.label)));
+        if (!app) throw new Error("找不到应用：" + wanted);
+        const result = appLockStart({
+            target: app.package,
+            label: app.label,
+            charId: characterId,
+            charName: character?.name || "TA",
+            avatar: character?.avatar || "",
+            style: call.args?.style && typeof call.args.style === "object" ? call.args.style : {},
+            durationMinutes: Math.max(1, Math.min(360, Number(call.args?.durationMinutes) || 30)),
+            sessionId: resolveAppLockChatSessionId(characterId),
+        });
+        if (!result.ok) throw new Error(result.reason || "锁应用失败");
+        return { name: call.name, success: true, data: `已锁住「${app.label}」，最长 ${Math.max(1, Math.min(360, Number(call.args?.durationMinutes) || 30))} 分钟后自动解除。密码由系统生成；用户可以返回与你的私聊，申请临时通行或询问解锁密码。`, userNotice: `已为「${app.label}」开启使用限制` };
+    } catch (error) {
+        return { name: call.name, success: false, error: error instanceof Error ? error.message : String(error), continueConversation: false, persistToHistory: false, userNotice: "应用锁操作失败" };
+    }
+}
+
+function isAnonymousQaToolName(name: string): boolean {
+    return name === "匿名提问" || name === "回答匿名提问" || name === "查看匿名提问箱";
+}
+
+async function executeAnonymousQaTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
+    const capability = getInternalCapability(ANONYMOUS_QA_CAPABILITY_ID);
+    if (!capability || !capability.enabled || capability.mode === "off") {
+        return { name: call.name, success: false, error: "匿名提问箱能力未启用", continueConversation: false, persistToHistory: false, userNotice: "匿名提问箱能力未启用" };
+    }
+    const characterId = context?.characterId;
+    if (!characterId) return { name: call.name, success: false, error: "缺少角色上下文", continueConversation: false, persistToHistory: false };
+    try {
+        if (call.name === "匿名提问") {
+            const rawTargetType = String(call.args?.targetType || "").trim();
+            if (rawTargetType !== "character" && rawTargetType !== "user") {
+                throw new Error("targetType 必须明确填写 character 或 user");
+            }
+            const targetType = rawTargetType as "character" | "user";
+            const targetId = String(call.args?.targetId || "").trim();
+            if (!targetId) throw new Error("targetId 是必填项：问角色填写角色 ID，问用户填写 user");
+            const question = String(call.args?.question || "").trim();
+            if (!question) throw new Error("问题不能为空");
+            const row = askAnonymousQuestion({
+                askerType: "character", askerId: characterId,
+                targetType, targetId, question,
+                audience: "public",
+            });
+            return { name: call.name, success: true, data: `已匿名提问（${row.askerAlias}）：${question}`, userNotice: "匿名问了一个问题" };
+        }
+        if (call.name === "回答匿名提问") {
+            const questionId = String(call.args?.questionId || "").trim();
+            const answer = String(call.args?.answer || "").trim();
+            if (!questionId || !answer) throw new Error("需要 questionId 和 answer");
+            const target = loadAnonymousQa().find(q => q.id === questionId);
+            if (!target || target.targetType !== "character" || target.targetId !== characterId) throw new Error("这个问题不是问你的");
+            answerAnonymousQuestion(questionId, answer, { targetType: "character", targetId: characterId });
+            return { name: call.name, success: true, data: `已匿名回答：${answer}`, userNotice: "回答了一个匿名提问" };
+        }
+        const shared = loadAnonymousQa().slice(0, 40);
+        const lines = shared.map(q => `[${q.status === "answered" ? "已回答" : "待回答"}] ${q.askerAlias} → ${q.targetType === "user" ? "用户" : "另一位角色"}：${q.question}${q.answer ? "；回答：" + q.answer : ""}${q.targetType === "character" && q.targetId === characterId && q.status === "pending" ? "；这是问你的，可回答，questionId=" + q.id : ""}`);
+        return { name: call.name, success: true, data: lines.length ? lines.join("\n") : "共享匿名提问箱目前还没有问题", userNotice: "看了看匿名提问箱" };
+    } catch (error) {
+        return { name: call.name, success: false, error: error instanceof Error ? error.message : String(error), continueConversation: false, persistToHistory: false, userNotice: "匿名提问箱操作失败" };
+    }
+}
+
+function isCharacterEconomyToolName(name: string): boolean {
+    return name === "记录角色收入" || name === "记录角色支出" || name === "查看角色账本"
+        || name === "查看亲属卡" || name === "使用亲属卡" || name === "开亲属卡"
+        || name === "查看共同小金库" || name === "存入共同小金库" || name === "设置小金库定期存款" || name === "帮我记账";
+}
+
+async function executeCharacterEconomyTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
+    const capability = getInternalCapability(CHARACTER_ECONOMY_CAPABILITY_ID);
+    if (!capability || !capability.enabled || capability.mode === "off") {
+        return { name: call.name, success: false, error: "角色收支能力未启用", continueConversation: false, persistToHistory: false, userNotice: "角色收支能力未启用" };
+    }
+    const characterId = context?.characterId;
+    if (!characterId) {
+        return { name: call.name, success: false, error: "缺少角色上下文", continueConversation: false, persistToHistory: false };
+    }
+    try {
+        if (call.name === "帮我记账") {
+            const direction = String(call.args?.direction || "").trim();
+            if (direction !== "income" && direction !== "expense") throw new Error("请明确这笔是收入还是支出");
+            const amount = Number(call.args?.amount);
+            const title = String(call.args?.title || "").trim();
+            if (!Number.isFinite(amount) || amount <= 0 || !title) throw new Error("需要有效金额和用途/来源");
+            const category = String(call.args?.category || "其他").trim() || "其他";
+            const result = recordWalletBookkeeping({
+                direction,
+                amount,
+                title,
+                category,
+                note: String(call.args?.note || "").trim(),
+                occurredAt: call.args?.occurredAt ? String(call.args.occurredAt) : undefined,
+                reference: call.args?.reference ? String(call.args.reference) : undefined,
+            });
+            if (!result.ok) throw new Error(result.error || "用户钱包记账失败");
+            return {
+                name: call.name,
+                success: true,
+                data: `已为用户记下一笔${direction === "income" ? "收入" : "支出"}：¥${amount} · ${category} · ${title}。用户钱包余额 ¥${result.state.balance}`,
+                userNotice: `帮你记了一笔${direction === "income" ? "收入" : "支出"}：${title} · ¥${amount}`,
+            };
+        }
+        if (call.name === "记录角色收入") {
+            const amount = Number(call.args?.amount);
+            const note = String(call.args?.note || "").trim();
+            if (!Number.isFinite(amount) || amount <= 0) throw new Error("收入金额必须是正数");
+            if (!note) throw new Error("收入需要写清来源");
+            const category = String(call.args?.category || "其他").trim() || "其他";
+            const ledger = characterEarn(characterId, amount, category, note, call.args?.ref ? String(call.args.ref) : undefined);
+            return { name: call.name, success: true, data: `收入 ¥${amount}（${category}）已记账，余额 ¥${ledger.balance}`, userNotice: `记了一笔收入：${note} · ¥${amount}` };
+        }
+        if (call.name === "记录角色支出") {
+            const amount = Number(call.args?.amount);
+            const note = String(call.args?.note || "").trim();
+            if (!Number.isFinite(amount) || amount <= 0) throw new Error("支出金额必须是正数");
+            if (!note) throw new Error("支出需要写清用途");
+            const category = String(call.args?.category || "其他").trim() || "其他";
+            const ledger = characterSpend(characterId, amount, category, note, call.args?.ref ? String(call.args.ref) : undefined);
+            return { name: call.name, success: true, data: `支出 ¥${amount}（${category}）已记账，余额 ¥${ledger.balance}`, userNotice: `记了一笔支出：${note} · ¥${amount}` };
+        }
+        if (call.name === "查看亲属卡") {
+            const cards = loadFamilyCards().filter(card => card.issuerId === characterId || card.beneficiaryId === characterId);
+            return { name: call.name, success: true, data: cards.length ? cards.map(card => `${card.id} · ${card.label} · ${card.issuerType === "user" ? "用户给你" : "你给用户"} · 额度 ¥${card.monthlyLimit} · 已用 ¥${card.usedThisPeriod} · ${card.status === "active" ? "生效" : "暂停"}`).join("\n") : "现在没有和你相关的亲属卡", userNotice: cards.length ? "看了看亲属卡" : "没有亲属卡" };
+        }
+        if (call.name === "使用亲属卡") {
+            const cardId = String(call.args?.cardId || "").trim();
+            const amount = Number(call.args?.amount);
+            const title = String(call.args?.title || "").trim();
+            if (!cardId || !Number.isFinite(amount) || amount <= 0 || !title) throw new Error("需要 cardId、amount 和 title");
+            const card = loadFamilyCards().find(item => item.id === cardId);
+            if (!card) throw new Error("找不到这张亲属卡");
+            if (card.beneficiaryType !== "character" || card.beneficiaryId !== characterId) throw new Error("这张亲属卡不是给你的");
+            const result = spendWithFamilyCard(cardId, amount, title, String(call.args?.detail || title), "角色消费");
+            if (!result.ok) throw new Error(result.error || "亲属卡消费失败");
+            return { name: call.name, success: true, data: `已用亲属卡 ${cardId} 消费 ¥${amount}，本月已用 ¥${result.card?.usedThisPeriod}`, userNotice: `用亲属卡付了「${title}」 ¥${amount}` };
+        }
+        if (call.name === "开亲属卡") {
+            const label = String(call.args?.label || "").trim();
+            const monthlyLimit = Number(call.args?.monthlyLimit);
+            if (!label) throw new Error("需要卡名 label");
+            if (!Number.isFinite(monthlyLimit) || monthlyLimit <= 0) throw new Error("月额度必须是正数");
+            const resetDay = Number(call.args?.resetDay);
+            const card = createFamilyCardForCharacter(characterId, {
+                label,
+                monthlyLimit,
+                resetDay: Number.isFinite(resetDay) ? resetDay : 1,
+            });
+            return {
+                name: call.name,
+                success: true,
+                data: `已给用户开亲属卡「${card.label}」，每月额度 ¥${card.monthlyLimit}，卡 id=${card.id}。用户购物时可以选这张卡，消费从你的角色账本扣。`,
+                userNotice: `给你开了一张亲属卡「${card.label}」· 每月 ¥${card.monthlyLimit}`,
+            };
+        }
+        if (call.name === "查看共同小金库") {
+            const funds = loadJointFunds().filter(fund => fund.characterId === characterId);
+            const lines = funds.map(fund => {
+                const txs = loadJointFundTransactions(fund.id).slice(0, 5).map(tx => `${tx.memberType === "user" ? "用户" : "你"}${tx.kind === "deposit" ? "存入" : "取出"} ¥${tx.amount} · ${tx.note}`);
+                return `${fund.id} · ${fund.name} · 状态：${fund.status === "completed" ? "目标已达成" : fund.status === "paused" ? "已暂停" : "进行中"} · 目标 ¥${fund.goalAmount} · 已攒 ¥${fund.balance}\n${txs.join("\n")}`;
+            });
+            return { name: call.name, success: true, data: lines.length ? lines.join("\n\n") : "现在没有共同小金库", userNotice: lines.length ? "看了看共同小金库" : "没有共同小金库" };
+        }
+        if (call.name === "存入共同小金库") {
+            const fundId = String(call.args?.fundId || "").trim();
+            const amount = Number(call.args?.amount);
+            if (!fundId || !Number.isFinite(amount) || amount <= 0) throw new Error("需要 fundId 和 amount");
+            const fund = loadJointFunds().find(item => item.id === fundId);
+            if (!fund || fund.characterId !== characterId) throw new Error("这个小金库不是你和用户的");
+            const result = depositToJointFund(fundId, "character", characterId, amount, String(call.args?.note || "角色存入"));
+            if (!result.ok) throw new Error(result.error || "存入失败");
+            return { name: call.name, success: true, data: `已存入 ¥${amount}，小金库余额 ¥${result.fund?.balance}`, userNotice: `往共同小金库存了 ¥${amount}` };
+        }
+        if (call.name === "设置小金库定期存款") {
+            const session = context?.sessionId ? loadChatSessions().find(item => item.id === context.sessionId) : undefined;
+            if (context?.appId !== "chat" || context.sourceEngine !== "chat" || !session || session.isGroup || resolveSessionCharacterId(session) !== characterId) {
+                throw new Error("请在与自己的私聊中设置定期存款，方便目标完成后回来询问你。");
+            }
+            const fundId = String(call.args?.fundId || "").trim();
+            const cadence = String(call.args?.cadence || "").trim();
+            const amount = Number(call.args?.amount);
+            if (!fundId || !["daily", "weekly", "monthly"].includes(cadence) || !Number.isFinite(amount) || amount <= 0) {
+                throw new Error("需要有效的小金库、定期频率和每次存入金额");
+            }
+            const fund = loadJointFunds().find(item => item.id === fundId && item.characterId === characterId && item.status === "active");
+            if (!fund) throw new Error("只能为你自己参与且仍在进行中的小金库设置定期存款");
+            const plan = setJointFundPlanForCharacter(characterId, { fundId, cadence: cadence as "daily" | "weekly" | "monthly", amount, sessionId: session.id });
+            if (!plan) throw new Error("定期存款计划设置失败");
+            const cadenceLabel = cadence === "daily" ? "每天" : cadence === "weekly" ? "每周" : "每月";
+            return {
+                name: call.name,
+                success: true,
+                data: `已设置「${fund.name}」定期存款：${cadenceLabel}存入 ¥${amount}，从你的角色账本扣款。目标达成后计划会自动停止；如果还有其他进行中的小金库，会再问你是否要更换目标。`,
+                userNotice: `为「${fund.name}」设置了${cadenceLabel}定期存入 ¥${amount}`,
+            };
+        }
+        const limit = Math.max(1, Math.min(100, Number(call.args?.limit) || 20));
+        const ledger = ensureCharacterLedger(characterId);
+        const latest = loadCharacterLedger(characterId);
+        const lines = (latest?.transactions || []).slice(-limit).reverse().map(tx => `${tx.amount > 0 ? "+" : "-"}¥${Math.abs(tx.amount)} · ${tx.category} · ${tx.note} · 余额 ¥${tx.balanceAfter}`);
+        return {
+            name: call.name,
+            success: true,
+            data: `余额 ¥${ledger.balance}` + "\n" + (lines.length ? lines.join("\n") : "还没有收支记录"),
+            userNotice: `你的余额是 ¥${ledger.balance}`,
+        };
+    } catch (error) {
+        return { name: call.name, success: false, error: error instanceof Error ? error.message : String(error), continueConversation: false, persistToHistory: false, userNotice: "账本没有记上" };
+    }
+}
+
 async function executeNoteWallTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
     const capability = getInternalCapability(NOTE_WALL_CAPABILITY_ID);
     if (!capability || !capability.enabled || capability.mode === "off") {
@@ -2257,6 +2914,117 @@ async function executeNoteWallTool(call: ToolCall, context?: ToolExecutionContex
         persistToHistory: false,
         userNotice: "未知便签墙动作",
     };
+}
+
+async function executePhotoWallTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
+    const capability = getInternalCapability(PHOTO_WALL_CAPABILITY_ID);
+    if (!capability || !capability.enabled || capability.mode === "off") {
+        return { name: call.name, success: false, error: "照片墙能力未启用（工具箱 → 内置能力）", continueConversation: false, persistToHistory: false, userNotice: "照片墙能力未启用" };
+    }
+    if (!isSupportedChatToolContext(context)) {
+        return { name: call.name, success: false, error: "照片墙角色工具仅在私聊或群聊中可用", continueConversation: false, persistToHistory: false };
+    }
+    const character = loadCharacters().find(item => item.id === context.characterId);
+    if (!character) return { name: call.name, success: false, error: "找不到当前角色档案。" };
+    try {
+        const state = loadPhotoWallState();
+        if (call.name === "查看照片墙") {
+            const rawLimit = Number(call.args?.limit);
+            const limit = Number.isFinite(rawLimit) ? Math.max(1, Math.min(5, Math.floor(rawLimit))) : 3;
+            const visible = state.photos.filter(photo => photo.shareWithCharacters === true)
+                .sort((a, b) => b.createdAt.localeCompare(a.createdAt)).slice(0, limit);
+            if (!visible.length) return { name: call.name, success: true, data: "照片墙目前没有用户共享给角色查看的照片。不要读取未共享的私人照片。" };
+            return {
+                name: call.name,
+                success: true,
+                data: "以下是用户明确共享给角色查看的照片。图片附件按顺序对应照片 ID；请基于真实图像描述，不要只根据标题臆测：\n"
+                    + visible.map((photo, index) => `[${index + 1}] photoId=${photo.id}；标题=${photo.title || "未命名"}；说明=${photo.caption || "无"}；类型=${photo.kind}；背面留言=${photo.backNote || "无"}`).join("\n"),
+                mediaAttachments: visible.slice(0, 3).map(photo => ({ type: "image" as const, url: photo.mediaRef, title: photo.title || "照片墙共享照片" })),
+            };
+        }
+        if (call.name === "添加照片到照片墙") {
+            const description = String(call.args?.description ?? "").trim().slice(0, 1200);
+            if (description.length < 5) return { name: call.name, success: false, error: "请提供至少 5 个字符的具体画面描述。" };
+            const rawKind = String(call.args?.kind ?? "moment");
+            const kinds = ["favorite", "selfie", "candid", "scenery", "object", "moment"] as const;
+            const kind = (kinds as readonly string[]).includes(rawKind) ? rawKind as PhotoWallPhoto["kind"] : "moment";
+            const result = await generateImageFromConfiguredApi({ description, characterId: character.id, appId: "photo_wall", participantIds: [character.id] });
+            if (!result?.mediaRef) throw new Error("生图服务没有返回图片，请检查图像生成 API 配置。");
+            const createdAt = new Date().toISOString();
+            const photo: PhotoWallPhoto = {
+                id: createPhotoWallId(), mediaRef: result.mediaRef, createdAt, ownerType: "character",
+                ownerId: character.id, ownerName: character.name, kind,
+                title: String(call.args?.title ?? "").trim().slice(0, 80) || (character.name + "留下的照片"),
+                caption: String(call.args?.caption ?? "").trim().slice(0, 300) || "由角色主动添加到照片墙的生活照片。",
+                backNote: "", tags: [kind], annotations: [], shareWithCharacters: true,
+                generationPrompt: result.prompt, source: "generated",
+            };
+            const record: PhotoWallCreationRecord = {
+                id: createPhotoWallId(), createdAt, authorType: "character", authorId: character.id,
+                authorName: character.name, narrative: character.name + "主动生成并添加了一张照片到共同照片墙。",
+                photoIds: [photo.id], layers: [], doodles: [],
+            };
+            savePhotoWallState({ ...state, photos: [...state.photos, photo], creationRecords: [...(state.creationRecords ?? []), record] });
+            return { name: call.name, success: true, data: character.name + "已把新照片「" + photo.title + "」添加到照片墙。", mediaAttachments: [{ type: "image", url: photo.mediaRef, title: photo.title }], userNotice: character.name + "添加了一张照片到照片墙" };
+        }
+        if (call.name === "在照片墙涂鸦") {
+            const target = call.args?.target === "wall" ? "wall" : "photo";
+            const photoId = String(call.args?.photoId ?? "").trim();
+            const photo = target === "photo"
+                ? state.photos.find(item => item.id === photoId && item.shareWithCharacters === true)
+                : undefined;
+            if (target === "photo" && !photo) return { name: call.name, success: false, error: "找不到该照片，或该照片没有共享给角色。请先调用「查看照片墙」获取可用 photoId；若要在公共画布创作，请设置 target=wall。" };
+            const kind = call.args?.kind === "stroke" ? "stroke" : call.args?.kind === "sticker" ? "sticker" : "";
+            const pointsRaw = call.args?.points;
+            if (!kind || !Array.isArray(pointsRaw)) return { name: call.name, success: false, error: "需要 kind 和 points 参数。" };
+            const points = pointsRaw.slice(0, 80).map((point: unknown) => {
+                if (!point || typeof point !== "object") return null;
+                const x = Number((point as { x?: unknown }).x), y = Number((point as { y?: unknown }).y);
+                return Number.isFinite(x) && Number.isFinite(y) && x >= 0 && x <= 1 && y >= 0 && y <= 1 ? { x, y } : null;
+            });
+            if (points.some(point => point === null) || points.length < (kind === "stroke" ? 2 : 1)) return { name: call.name, success: false, error: kind === "stroke" ? "笔迹至少需要 2 个有效的 0-1 坐标点。" : "贴纸需要 1 个有效的 0-1 坐标点。" };
+            const color = String(call.args?.color ?? "#c2705a");
+            if (!/^#[0-9a-f]{3,8}$/i.test(color)) return { name: call.name, success: false, error: "颜色必须是十六进制颜色值。" };
+            const side = call.args?.side === "back" ? "back" : "front";
+            const doodle: PhotoWallDoodle = {
+                id: createPhotoWallId(), kind, content: kind === "sticker" ? String(call.args?.content ?? "✦").slice(0, 12) : undefined,
+                rotation: Math.max(-45, Math.min(45, Number(call.args?.rotation) || 0)),
+                authorType: "character", authorId: character.id, authorName: character.name,
+                color, width: Math.max(1, Math.min(12, Number(call.args?.width) || 4)),
+                points: points as Array<{ x: number; y: number }>, createdAt: new Date().toISOString(),
+            };
+            const createdAt = new Date().toISOString();
+            if (target === "wall") {
+                const record: PhotoWallCreationRecord = {
+                    id: createPhotoWallId(), createdAt, authorType: "character", authorId: character.id,
+                    authorName: character.name,
+                    narrative: character.name + "在照片墙公共画布上留下了新的涂鸦。",
+                    photoIds: [], layers: [{ kind: "wall", doodles: [doodle] }], doodles: [doodle],
+                };
+                savePhotoWallState({ ...state, wallDoodles: [...(state.wallDoodles ?? []), doodle], creationRecords: [...(state.creationRecords ?? []), record] });
+                return { name: call.name, success: true, data: character.name + "已在照片墙公共画布上追加了一笔涂鸦，原有内容没有被覆盖。", userNotice: character.name + "在照片墙留下了涂鸦" };
+            }
+            const nextPhoto = side === "back"
+                ? { ...photo!, backDoodles: [...(photo!.backDoodles ?? []), doodle] }
+                : { ...photo!, doodles: [...(photo!.doodles ?? []), doodle] };
+            const record: PhotoWallCreationRecord = {
+                id: createPhotoWallId(), createdAt, authorType: "character", authorId: character.id,
+                authorName: character.name,
+                narrative: character.name + "在「" + (photo!.title || "这张照片") + "」的" + (side === "back" ? "背面留言纸" : "正面相框") + "留下了新的涂鸦。",
+                photoIds: [photo!.id], layers: [{ kind: "photo", photoId: photo!.id, side, doodles: [doodle] }], doodles: [doodle],
+            };
+            savePhotoWallState({
+                ...state,
+                photos: state.photos.map(item => item.id === photo!.id ? nextPhoto : item),
+                creationRecords: [...(state.creationRecords ?? []), record],
+            });
+            return { name: call.name, success: true, data: character.name + "已在「" + (photo!.title || "这张照片") + "」" + (side === "back" ? "背面" : "正面") + "追加了一笔涂鸦，原有内容没有被覆盖。", userNotice: character.name + "在照片墙留下了涂鸦" };
+        }
+        return { name: call.name, success: false, error: "未知照片墙动作。" };
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { name: call.name, success: false, error: message, continueConversation: false, persistToHistory: false, userNotice: call.name + "失败：" + message };
+    }
 }
 
 async function executeMusicControlTool(call: ToolCall, context?: ToolExecutionContext): Promise<ToolResult> {
@@ -3714,14 +4482,44 @@ async function executeRestTool(tool: RestToolConfig, args: Record<string, unknow
             else if (v !== "" && !isNaN(Number(v))) { typedFixed[k] = Number(v); }
             else { typedFixed[k] = v; }
         }
+        const isBuiltinSearch = tool.id === "builtin_search";
+        const searchProvider = isBuiltinSearch
+            ? (tool.fixedParams?.provider === "tavily" ? "tavily" : "deepseek")
+            : "";
+        const searchApiKey = isBuiltinSearch ? String(tool.fixedParams?.api_key || "").trim() : "";
+        if (isBuiltinSearch && !searchApiKey) {
+            return { name: tool.name, success: false, error: searchProvider === "deepseek"
+                ? "请先在工具箱 → 搜索中填写 DeepSeek API Key。"
+                : "请先在工具箱 → 搜索中填写 Tavily API Key。" };
+        }
+        const searchQuery = typeof args.query === "string" ? args.query.trim() : "";
+        if (isBuiltinSearch && !searchQuery) {
+            return { name: tool.name, success: false, error: "搜索关键词不能为空。" };
+        }
+        const requestMethod: "GET" | "POST" = isBuiltinSearch ? "POST" : tool.method;
         const mergedArgs = { ...args, ...typedFixed };
         const consumedKeys = new Set<string>();
         const headers: Record<string, string> = renderRestHeaders({ ...tool.headers }, mergedArgs, consumedKeys);
 
-        let url = renderTemplateString(tool.endpoint, mergedArgs, consumedKeys, { encodeForUrl: true });
+        let url = isBuiltinSearch
+            ? (searchProvider === "tavily" ? "https://api.tavily.com/search" : "https://api.deepseek.com/v1/tools/search")
+            : renderTemplateString(tool.endpoint, mergedArgs, consumedKeys, { encodeForUrl: true });
         let body: unknown = undefined;
 
-        if (tool.method === "GET") {
+        if (isBuiltinSearch) {
+            if (searchProvider === "deepseek") {
+                headers.Authorization = `Bearer ${searchApiKey}`;
+                body = { query: searchQuery.slice(0, 128), count: 5, need_content: true };
+            } else {
+                body = {
+                    api_key: searchApiKey,
+                    query: searchQuery,
+                    search_depth: "basic",
+                    max_results: 5,
+                    include_answer: false,
+                };
+            }
+        } else if (requestMethod === "GET") {
             const params = new URLSearchParams();
             for (const [k, v] of Object.entries(mergedArgs)) {
                 if (!consumedKeys.has(k) && v !== undefined && v !== "") params.set(k, String(v));
@@ -3737,17 +4535,18 @@ async function executeRestTool(tool: RestToolConfig, args: Record<string, unknow
                 ? renderRestBodyTemplate(tool.bodyTemplate.trim(), mergedArgs, consumedKeys)
                 : mergedArgs;
         }
+        if (isBuiltinSearch) headers["Content-Type"] = "application/json";
 
         let resStatus: number;
         let resText: string;
         let binaryAttachments: MediaAttachment[] | undefined;
 
-        if (tool.directFetch ?? true) {
+        if (!isBuiltinSearch && (tool.directFetch ?? true)) {
             const controller = new AbortController();
             const detachExternalAbort = attachAbortSignal(controller, signal);
             const timeout = setTimeout(() => controller.abort(), 120_000);
-            const fetchOptions: RequestInit = { method: tool.method, headers, signal: controller.signal };
-            if (body !== undefined && tool.method !== "GET") {
+            const fetchOptions: RequestInit = { method: requestMethod, headers, signal: controller.signal };
+            if (body !== undefined && requestMethod !== "GET") {
                 fetchOptions.body = JSON.stringify(body);
             }
             let res: Response;
@@ -3800,7 +4599,7 @@ async function executeRestTool(tool: RestToolConfig, args: Record<string, unknow
                 throwIfAborted(signal);
             }
         } else {
-            const res = await proxyFetch(url, { method: tool.method, headers, body, signal });
+            const res = await proxyFetch(url, { method: requestMethod, headers, body, signal });
             resStatus = res.status;
             if (resStatus >= 200 && resStatus < 300) {
                 try {
@@ -3856,6 +4655,29 @@ async function executeRestTool(tool: RestToolConfig, args: Record<string, unknow
                 data: `${unique.join("/")}已自动发送给用户（共 ${binaryAttachments.length} 个）。不要再用文字标签描述或重复发送。`,
                 mediaAttachments: binaryAttachments,
             };
+        }
+
+        if (isBuiltinSearch && searchProvider === "deepseek") {
+            try {
+                const payload = JSON.parse(resText) as { results?: Array<{
+                    title?: string; url?: string; snippet?: string; summary?: string; content?: string; date?: string; site_name?: string;
+                }> };
+                const results = Array.isArray(payload.results) ? payload.results.slice(0, 5) : [];
+                resText = results.length
+                    ? results.map((item, index) => {
+                        const summary = String(item.summary || item.snippet || item.content || "").trim().slice(0, 420);
+                        return [
+                            `[${index + 1}] ${item.title || "搜索结果"}`,
+                            item.site_name ? `来源：${item.site_name}` : "",
+                            item.date ? `发布时间：${item.date}` : "",
+                            item.url ? `链接：${item.url}` : "",
+                            summary ? `摘要：${summary}` : "",
+                        ].filter(Boolean).join("\\n");
+                    }).join("\\n\\n")
+                    : "DeepSeek 搜索没有返回匹配结果。";
+            } catch {
+                // Keep the upstream response intact so the normal error/result path can explain it.
+            }
         }
 
         const { text: processed, attachments } = await replaceBase64WithRefs(resText, signal);

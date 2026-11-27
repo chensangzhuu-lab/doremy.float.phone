@@ -22,6 +22,15 @@ import {
   WIDGET_PLACEHOLDERS,
   WIDGET_UPDATED_EVENT,
   canGenerateAvatar,
+  deleteWidgetProfile,
+  deleteWidgetProfileNative,
+  injectWidgetCss,
+  loadWidgetProfiles,
+  pushWidgetProfileHtml,
+  requestPinWidgetProfile,
+  saveWidgetProfile,
+  syncWidgetProfilesToNative,
+  type WidgetProfile,
   hasWidgetBridge,
   isWidgetPlaced,
   loadWidgetConfig,
@@ -34,6 +43,16 @@ import {
   saveWidgetData,
   type WidgetConfig,
 } from "@/lib/widget";
+import {
+  DEFAULT_FOCUS_WIDGET_STYLE,
+  loadFocusWidgetStyle,
+  saveFocusWidgetStyle,
+  type FocusWidgetStyle,
+} from "@/lib/widget/focus-style";
+import {
+  focusWidgetPin as shellFocusWidgetPin,
+  focusWidgetUpdate as shellFocusWidgetUpdate,
+} from "@/lib/device-action/bridge";
 
 /** 预览用的示例数据：用户还没让角色留话时，先让模板有东西可显示。 */
 const SAMPLE_TEXT = "今天路过那家店，想起你说想吃他家的小笼包";
@@ -41,6 +60,16 @@ const SAMPLE_STATUS = "在想你";
 
 function clampInt(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, Math.round(value)));
+}
+
+/** #RRGGBB + 不透明度百分比 → rgba() 预览用 */
+function hexWithAlpha(hex: string, alphaPct: number): string {
+  const h = (hex || "#000000").replace("#", "");
+  const r = parseInt(h.slice(0, 2), 16) || 0;
+  const g = parseInt(h.slice(2, 4), 16) || 0;
+  const b = parseInt(h.slice(4, 6), 16) || 0;
+  const a = Math.max(0, Math.min(100, Math.round(alphaPct))) / 100;
+  return `rgba(${r},${g},${b},${a.toFixed(2)})`;
 }
 
 export function WidgetSettings({ onNotice }: { onNotice?: (msg: string) => void }) {
@@ -55,22 +84,29 @@ export function WidgetSettings({ onNotice }: { onNotice?: (msg: string) => void 
   const [dataVersion, setDataVersion] = useState(0);
   /** 诊断结果（逐行）。null = 还没点过「检查」。 */
   const [diagnosis, setDiagnosis] = useState<string[] | null>(null);
+  const [profiles, setProfiles] = useState<WidgetProfile[]>(() => loadWidgetProfiles());
+  const [profileDraft, setProfileDraft] = useState<WidgetProfile | null>(null);
+  /** 专注倒计时小组件的样式（独立卡，随改随预览，保存才推送壳侧） */
+  const [focusStyle, setFocusStyle] = useState<FocusWidgetStyle>(() => loadFocusWidgetStyle());
 
   const characters = useMemo(() => loadCharacters().map(c => ({ id: c.id, name: c.name, avatar: c.avatar ?? "" })), []);
 
   const refresh = useCallback(() => {
     setConfig(loadWidgetConfig());
     setPlaced(isWidgetPlaced());
+    setProfiles(loadWidgetProfiles());
     setDataVersion(v => v + 1);
   }, []);
 
   useEffect(() => {
     const onChange = () => refresh();
     window.addEventListener(WIDGET_UPDATED_EVENT, onChange);
-    const onVisible = () => { if (document.visibilityState === "visible") setPlaced(isWidgetPlaced()); };
+    window.addEventListener("virtual-life-state-updated", onChange);
+    const onVisible = () => { if (document.visibilityState === "visible") { setPlaced(isWidgetPlaced()); refresh(); } };
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       window.removeEventListener(WIDGET_UPDATED_EVENT, onChange);
+      window.removeEventListener("virtual-life-state-updated", onChange);
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [refresh]);
@@ -150,9 +186,8 @@ export function WidgetSettings({ onNotice }: { onNotice?: (msg: string) => void 
       onNotice?.("当前 App 版本不支持桌面小组件，需要更新安卓壳");
       return;
     }
-    if (!requestPinWidget()) {
-      onNotice?.("这个系统不支持一键添加，请长按桌面手动添加「float」小组件");
-    }
+    const ok = requestPinWidget();
+    onNotice?.(ok ? "已请求系统添加桌面小组件。所有实例共用当前角色、内容和样式。" : "当前启动器不支持从应用内添加，请手动在桌面添加小组件。");
   }, [onNotice]);
 
   /** 手动塞一条示例内容，方便用户先看看桌面上长什么样。 */
@@ -169,6 +204,119 @@ export function WidgetSettings({ onNotice }: { onNotice?: (msg: string) => void 
     setDataVersion(v => v + 1);
     onNotice?.("已写入示例内容");
   }, [config.characterId, activeCharacterAvatar, onNotice]);
+
+  /** 保存专注组件样式并推到壳侧（styleOnly：不动正在运行的会话状态）。 */
+  const saveFocusStyleAndPush = useCallback(() => {
+    saveFocusWidgetStyle(focusStyle);
+    const r = shellFocusWidgetUpdate(JSON.stringify({ styleOnly: true, style: focusStyle }));
+    onNotice?.(r.ok ? "样式已保存并推送到桌面" : (r.reason || "推送失败，请检查壳版本"));
+  }, [focusStyle, onNotice]);
+
+  const resetFocusStyle = useCallback(() => {
+    setFocusStyle({ ...DEFAULT_FOCUS_WIDGET_STYLE });
+    saveFocusWidgetStyle(DEFAULT_FOCUS_WIDGET_STYLE);
+    onNotice?.("已恢复默认样式，记得点「保存并推送桌面」");
+  }, [onNotice]);
+
+  const pinFocusWidget = useCallback(() => {
+    const r = shellFocusWidgetPin();
+    onNotice?.(r.ok ? "已请求系统添加专注组件" : (r.reason || "当前启动器不支持从应用内添加，请在桌面长按手动添加"));
+  }, [onNotice]);
+
+  const createProfile = useCallback(() => {
+    const now = new Date().toISOString();
+    const profile: WidgetProfile = {
+      id: "widget-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),
+      name: "自定义小组件 " + (profiles.length + 1),
+      characterId: config.characterId || characters[0]?.id || "",
+      template: templateDraft || DEFAULT_WIDGET_TEMPLATE,
+      customCss: "",
+      widthDp: config.widthDp,
+      heightDp: config.heightDp,
+      scale: config.scale,
+      createdAt: now,
+      updatedAt: now,
+    };
+    setProfileDraft(profile);
+    onNotice?.("已创建独立配置。可以分别选择角色、编辑 HTML/CSS，再添加到真实桌面。");
+  }, [profiles.length, config, characters, templateDraft, onNotice]);
+
+  const profilePreviewHtml = useMemo(() => {
+    if (!profileDraft) return "";
+    const character = characters.find(item => item.id === profileDraft.characterId);
+    const actual = loadWidgetData(profileDraft.characterId);
+    const data = actual ?? {
+      characterId: profileDraft.characterId,
+      text: SAMPLE_TEXT,
+      status: SAMPLE_STATUS,
+      avatar: character?.avatar ?? "",
+      updatedAt: new Date().toISOString(),
+      source: "manual" as const,
+    };
+    return injectWidgetCss(
+      renderWidgetHtml(profileDraft.template || DEFAULT_WIDGET_TEMPLATE, data, character?.name ?? "角色", "你"),
+      profileDraft.customCss,
+    );
+  }, [profileDraft, characters, dataVersion]);
+
+  const patchProfileDraft = (patch: Partial<WidgetProfile>) => {
+    setProfileDraft(current => current ? { ...current, ...patch } : current);
+  };
+
+  const persistProfileDraft = () => {
+    if (!profileDraft) return;
+    saveWidgetProfile(profileDraft);
+    setProfiles(loadWidgetProfiles());
+    onNotice?.("已保存「" + profileDraft.name + "」配置。");
+  };
+
+  const pushProfileDraft = () => {
+    if (!profileDraft) return;
+    saveWidgetProfile(profileDraft);
+    setProfiles(loadWidgetProfiles());
+    if (!hasWidgetBridge()) { onNotice?.("当前 App 版本没有桌面小组件桥，请安装新版 APK。"); return; }
+    const ok = pushWidgetProfileHtml(profileDraft.id, profilePreviewHtml, {
+      widthDp: profileDraft.widthDp, heightDp: profileDraft.heightDp, scale: profileDraft.scale,
+    });
+    onNotice?.(ok ? "已提交该配置的原生渲染。添加前请确认桌面诊断显示渲染成功。" : "当前 APK 尚不支持独立小组件配置，需要更新安卓壳。");
+  };
+
+  const placeProfileDraft = () => {
+    if (!profileDraft) return;
+    if (!hasWidgetBridge()) { onNotice?.("当前 App 版本没有桌面小组件桥，请安装新版 APK。"); return; }
+
+    // 每次「添加到真实桌面」都生成新的 profile ID。否则重复添加同一份草稿时，
+    // Android 会把多个 appWidgetId 绑定到同一缓存，导致第二块小组件与第一块完全相同。
+    const now = new Date().toISOString();
+    const instanceProfile: WidgetProfile = {
+      ...profileDraft,
+      id: "widget-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),
+      name: (profileDraft.name.trim() || "桌面实例") + " · 实例 " + (profiles.length + 1),
+      createdAt: now,
+      updatedAt: now,
+    };
+    saveWidgetProfile(instanceProfile);
+    setProfiles(loadWidgetProfiles());
+
+    const pushed = pushWidgetProfileHtml(instanceProfile.id, profilePreviewHtml, {
+      widthDp: instanceProfile.widthDp, heightDp: instanceProfile.heightDp, scale: instanceProfile.scale,
+    });
+    if (!pushed) { onNotice?.("原生侧没有接受这份模板，无法继续添加；配置已保留，可检查 APK 版本后重试。"); return; }
+    const accepted = requestPinWidgetProfile(instanceProfile.id);
+    if (accepted) setProfileDraft(instanceProfile);
+    onNotice?.(accepted
+      ? "已请求系统添加「" + instanceProfile.name + "」。每次添加都会使用新的实例 ID 和独立缓存；请在桌面确认流程中完成添加。"
+      : "当前 APK 或启动器不支持按配置添加，需要更新安卓壳或在桌面手动添加默认小组件。");
+  };
+
+  const removeProfileDraft = () => {
+    if (!profileDraft) return;
+    const removed = deleteWidgetProfileNative(profileDraft.id);
+    deleteWidgetProfile(profileDraft.id);
+    setProfiles(loadWidgetProfiles());
+    setProfileDraft(null);
+    onNotice?.(removed ? "已删除配置；关联的桌面实例已恢复为默认小组件。" : "已删除本地配置。旧 APK 里的桌面实例无法按配置清理，更新新版 APK 后即可管理独立实例。");
+  };
 
   const bridgeOk = hasWidgetBridge();
   const previewWidth = clampInt(config.widthDp, WIDGET_LIMITS.widthDp.min, WIDGET_LIMITS.widthDp.max);
@@ -289,12 +437,13 @@ export function WidgetSettings({ onNotice }: { onNotice?: (msg: string) => void 
 
             {!bridgeOk ? (
               <p className="ws-warn">当前 App 版本不支持桌面小组件——需要更新安卓壳。</p>
-            ) : !placed ? (
+            ) : (
               <div className="ws-inline-row">
-                <span>还没有放到桌面上</span>
-                <button type="button" className="ws-link" onClick={placeWidget}>添加到桌面</button>
+                <span>{placed ? "桌面已有实例，可再添加一个同款小组件" : "还没有放到桌面上"}</span>
+                <button type="button" className="ws-link" onClick={placeWidget}>{placed ? "新建独立实例" : "创建桌面实例"}</button>
               </div>
-            ) : null}
+            )}
+            <p className="ws-hint">桌面实例共用当前角色、内容和样式；不支持按实例分别配置。</p>
           </>
         ) : null}
       </div>
@@ -339,7 +488,7 @@ export function WidgetSettings({ onNotice }: { onNotice?: (msg: string) => void 
             </div>
             <p className="ws-hint">
               这里可以写任意 HTML 和 CSS——渐变、圆角、阴影、字体、透明度、对齐都能用。
-              桌面上显示什么，就是这段代码渲染出来的样子。
+              桌面上显示什么，就是这段代码渲染出来的样子。新增的生活状态占位符复用生活 APP 的虚拟时间、当前活动、地点线索和下一项日程，不用重复配置时钟。小手机运行且调度可用时会刷新；应用完全退出后不保证实时后台更新。
             </p>
 
             {templateExpanded ? (
@@ -444,6 +593,95 @@ export function WidgetSettings({ onNotice }: { onNotice?: (msg: string) => void 
           </div>
         </>
       ) : null}
+
+      {/* ── 专注倒计时（独立小组件）── */}
+      <div className="ws-card">
+        <div className="ws-card-head">
+          <span className="ws-card-title">⏳ 专注倒计时（独立小组件）</span>
+        </div>
+        <p className="ws-hint">
+          专注 / 锁机会话的秒级倒计时卡（原生 Chronometer 走表，改时间无效），
+          与上面的角色留言卡互相独立。样式随改随预览，点保存才落到桌面。
+        </p>
+
+        {/* 实时预览：与原生 RemoteViews 渲染同一份输入（背景色+不透明度/文字色/次要色/圆角/行开关） */}
+        <div style={{ display: "flex", justifyContent: "center", padding: "6px 0 14px" }}>
+          <div
+            style={{
+              width: 250,
+              padding: 16,
+              borderRadius: focusStyle.radius,
+              background: hexWithAlpha(focusStyle.bg, focusStyle.bgAlpha),
+              border: "1px solid rgba(128,128,128,.18)",
+            }}
+          >
+            <div style={{ color: hexWithAlpha(focusStyle.textColor, focusStyle.dimAlpha), fontSize: 11, letterSpacing: 2 }}>专注 · FOCUS</div>
+            <div style={{ color: focusStyle.textColor, fontSize: 34, fontFamily: "monospace", marginTop: 4 }}>25:00</div>
+            <div style={{ height: 5, borderRadius: 3, background: hexWithAlpha(focusStyle.textColor, 14), marginTop: 10, overflow: "hidden" }}>
+              <div style={{ width: "38%", height: "100%", borderRadius: 3, background: "linear-gradient(90deg,#7C8CFF,#5EEAD4)" }} />
+            </div>
+            {focusStyle.showTask ? (
+              <div style={{ color: focusStyle.textColor, fontSize: 12, marginTop: 12, opacity: 0.92 }}>背 20 个单词 · 第 2/4 组</div>
+            ) : null}
+            {focusStyle.showTa ? (
+              <div style={{ color: hexWithAlpha(focusStyle.textColor, focusStyle.dimAlpha), fontSize: 11, marginTop: 6 }}>Alex · 陪你把这段时间走完</div>
+            ) : null}
+          </div>
+        </div>
+
+        <div className="ws-grid2">
+          <label className="ws-field">
+            背景色
+            <input type="color" value={focusStyle.bg} onChange={e => setFocusStyle(s => ({ ...s, bg: e.target.value }))} />
+          </label>
+          <label className="ws-field">
+            背景不透明度 {focusStyle.bgAlpha}%
+            <input type="range" min={0} max={100} value={focusStyle.bgAlpha} onChange={e => setFocusStyle(s => ({ ...s, bgAlpha: Number(e.target.value) }))} />
+          </label>
+          <label className="ws-field">
+            文字色
+            <input type="color" value={focusStyle.textColor} onChange={e => setFocusStyle(s => ({ ...s, textColor: e.target.value }))} />
+          </label>
+          <label className="ws-field">
+            次要文字 {focusStyle.dimAlpha}%
+            <input type="range" min={0} max={100} value={focusStyle.dimAlpha} onChange={e => setFocusStyle(s => ({ ...s, dimAlpha: Number(e.target.value) }))} />
+          </label>
+          <label className="ws-field">
+            圆角
+            <select value={focusStyle.radius} onChange={e => setFocusStyle(s => ({ ...s, radius: Number(e.target.value) }))}>
+              <option value={8}>小（8dp）</option>
+              <option value={16}>中（16dp）</option>
+              <option value={24}>大（24dp）</option>
+            </select>
+          </label>
+        </div>
+
+        <div className="ws-row">
+          <div className="ws-row-text">
+            <b>显示任务行</b>
+            <p>当前专注任务（没填任务时显示占位语）</p>
+          </div>
+          <Toggle checked={focusStyle.showTask} onChange={v => setFocusStyle(s => ({ ...s, showTask: v }))} />
+        </div>
+        <div className="ws-row">
+          <div className="ws-row-text">
+            <b>显示 TA 行</b>
+            <p>陪伴角色名与那句鼓励语</p>
+          </div>
+          <Toggle checked={focusStyle.showTa} onChange={v => setFocusStyle(s => ({ ...s, showTa: v }))} />
+        </div>
+
+        <p className="ws-hint">进度条颜色跟随内置配色；会话运行中保存样式不影响正在走的倒计时。</p>
+        <div className="ws-template-actions">
+          <button type="button" className="ws-btn ghost" onClick={resetFocusStyle}>恢复默认</button>
+          <button type="button" className="ws-btn" onClick={saveFocusStyleAndPush}>保存并推送桌面</button>
+        </div>
+        <div className="ws-inline-row">
+          <span>还没有放到桌面上？</span>
+          <button type="button" className="ws-link" onClick={pinFocusWidget}>添加专注组件到桌面</button>
+        </div>
+      </div>
+
     </div>
   );
 }

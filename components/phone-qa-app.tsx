@@ -7,7 +7,7 @@ import remarkGfm from "remark-gfm";
 // （** 后跟标点时要求前面是空格/标点，中文里前面通常是汉字），中文消息大量中招。
 import remarkCjkFriendly from "remark-cjk-friendly";
 import remarkBreaks from "remark-breaks";
-import { AppWindow, ArrowUp, BrushCleaning, Check, ChevronLeft, ChevronRight, Copy, Drama, FileCode2, FileText, Gamepad2, Github, Image as ImageIcon, Loader2, Menu, MoreVertical, Paperclip, Pencil, Pin, PinOff, Play, Plus, Square, Trash2, Wrench, X } from "lucide-react";
+import { AppWindow, ArrowUp, BrushCleaning, Check, ChevronLeft, ChevronRight, Copy, Drama, FileCode2, FileText, Gamepad2, Github, Image as ImageIcon, Loader2, Menu, MoreVertical, Paperclip, Pencil, Pin, PinOff, Play, Plus, Search, Square, Trash2, Wrench, X } from "lucide-react";
 import { getQaApiLogs, clearQaApiLogs, type DebugInfo } from "@/lib/api-log-store";
 import { QaFileCard } from "@/components/qa-file-card";
 import { parseQaFileMarker } from "@/lib/qa-computer-tools";
@@ -309,7 +309,7 @@ const QaMessageItem = memo(function QaMessageItem({
   // 生成中不显示（内容还不完整，复制/编辑都没有意义）。
   const showActions = !isStreaming && !thinkingOnly;
   const msgWrap = (node: ReactNode) => (
-    <div className="qa-msg-wrap">
+    <div className="qa-msg-wrap" data-qa-message-id={msg.id}>
       {node}
       {showActions && (
         <div className="qa-msg-actions" data-role={msg.role}>
@@ -891,6 +891,19 @@ export function PhoneQaApp({ onClose, onNotice }: PhoneQaAppProps) {
     [snapshot.sessions, snapshot.activeSessionId],
   );
   const messages = useMemo(() => activeSession?.messages ?? [], [activeSession]);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchCursor, setSearchCursor] = useState(0);
+  const [pendingSearchJump, setPendingSearchJump] = useState<{ sessionId: string; messageId: string } | null>(null);
+  const searchMatches = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return [];
+    return snapshot.sessions.flatMap(session =>
+      session.messages
+        .filter(message => (message.content || "").toLowerCase().includes(query))
+        .map(message => ({ sessionId: session.id, sessionTitle: session.title, message })),
+    );
+  }, [snapshot.sessions, searchQuery]);
   const createdContent = useMemo(() => activeSession?.createdContent ?? [], [activeSession]);
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewItem, setPreviewItem] = useState<QaCreatedContent | null>(null);
@@ -899,7 +912,65 @@ export function PhoneQaApp({ onClose, onNotice }: PhoneQaAppProps) {
     [previewItem],
   );
 
-  // 自动滚动：用户上滚阅读时不拉回底部
+  // Let the most-specific workshop panel close before the phone closes the app.
+  // This also makes swipe-back behave like Android's nested back stack.
+  useEffect(() => {
+    const onPhoneSwipeBack = (event: Event) => {
+      if (event.defaultPrevented) return;
+      const consume = (action: () => void) => { event.preventDefault(); action(); };
+      if (viewerImage) return consume(() => setViewerImage(null));
+      if (editingMsg) return consume(() => { setEditingMsg(null); setEditText(""); setEditImages([]); setEditFiles([]); setEditAttachMenuOpen(false); });
+      if (repoSheetOpen) return consume(() => setRepoSheetOpen(false));
+      if (apiLogOpen) return consume(() => setApiLogOpen(false));
+      if (settingsOpen) return consume(() => setSettingsOpen(false));
+      if (renameTarget) return consume(() => setRenameTarget(null));
+      if (clearToolsOpen) return consume(() => setClearToolsOpen(false));
+      if (previewItem) return consume(() => setPreviewItem(null));
+      if (previewOpen) return consume(() => setPreviewOpen(false));
+      if (editAttachMenuOpen) return consume(() => setEditAttachMenuOpen(false));
+      if (attachMenuOpen) return consume(() => setAttachMenuOpen(false));
+      if (drawerOpen) return consume(() => setDrawerOpen(false));
+    };
+    document.addEventListener("phone-swipe-back", onPhoneSwipeBack);
+    return () => document.removeEventListener("phone-swipe-back", onPhoneSwipeBack);
+  }, [
+    viewerImage, editingMsg, repoSheetOpen, apiLogOpen, settingsOpen, renameTarget,
+    clearToolsOpen, previewItem, previewOpen, editAttachMenuOpen, attachMenuOpen, drawerOpen,
+  ]);
+
+  // 搜索结果可能位于另一个会话。先切换会话，再等目标消息真正挂载后定位，
+  // 不再依赖固定 160ms 延时（低端 WebView / 大会话加载时经常来不及）。
+  const jumpToSearchMatch = useCallback((index: number) => {
+    const match = searchMatches[index];
+    if (!match) return;
+    setSearchCursor(index);
+    setPendingSearchJump({ sessionId: match.sessionId, messageId: match.message.id });
+    if (match.sessionId !== snapshot.activeSessionId) {
+      switchQaSession(match.sessionId);
+      setDrawerOpen(false);
+    }
+  }, [searchMatches, snapshot.activeSessionId]);
+
+  useEffect(() => {
+    if (!pendingSearchJump || snapshot.activeSessionId !== pendingSearchJump.sessionId) return;
+    let attempts = 0;
+    let frame = 0;
+    const locate = () => {
+      const nodes = bodyRef.current?.querySelectorAll<HTMLElement>("[data-qa-message-id]");
+      const target = nodes ? Array.from(nodes).find(node => node.dataset.qaMessageId === pendingSearchJump.messageId) : null;
+      if (target) {
+        target.scrollIntoView({ block: "center", behavior: "smooth" });
+        setPendingSearchJump(null);
+        return;
+      }
+      attempts += 1;
+      if (attempts < 12) frame = window.requestAnimationFrame(locate);
+      else setPendingSearchJump(null);
+    };
+    frame = window.requestAnimationFrame(locate);
+    return () => window.cancelAnimationFrame(frame);
+  }, [pendingSearchJump, snapshot.activeSessionId, messages]);
+
   const handleScroll = useCallback(() => {
     const el = bodyRef.current;
     if (!el) return;
@@ -1067,7 +1138,7 @@ export function PhoneQaApp({ onClose, onNotice }: PhoneQaAppProps) {
           setRenameTitle(title);
         }}
       />
-      <div className={`qa-stage ${drawerOpen ? "is-pushed" : ""}`}>
+      <div className={`qa-stage ${drawerOpen && !repoSheetOpen ? "is-pushed" : ""}`}>
       <div className="qa-ambient" aria-hidden />
       <header className="qa-header">
         <div className="qa-header-left">
@@ -1098,11 +1169,40 @@ export function PhoneQaApp({ onClose, onNotice }: PhoneQaAppProps) {
           >
             <BrushCleaning size={17} strokeWidth={1.75} />
           </button>
+          <button type="button" className="qa-icon-btn" onClick={() => { setSearchOpen(v => !v); setSearchQuery(""); setSearchCursor(0); }} aria-label="搜索当前对话">
+            <Search size={17} strokeWidth={1.75} />
+          </button>
           <button type="button" className="qa-icon-btn" onClick={() => setDrawerOpen((v) => !v)} aria-label="对话记录">
             <Menu size={18} strokeWidth={1.75} />
           </button>
         </div>
       </header>
+
+      {searchOpen && (
+        <div className="qa-search-panel">
+          <div className="qa-search-controls">
+            <input className="qa-search-input" value={searchQuery} onChange={event => { setSearchQuery(event.target.value); setSearchCursor(0); }} onKeyDown={event => { if (event.key === "Enter") { event.preventDefault(); jumpToSearchMatch(searchCursor); } }} placeholder="搜索全部对话的关键词…" autoFocus />
+            <button type="button" onClick={() => jumpToSearchMatch(Math.max(0, searchCursor - 1))} disabled={!searchMatches.length} className="qa-icon-btn" aria-label="上一个匹配">‹</button>
+            <button type="button" onClick={() => jumpToSearchMatch(Math.min(searchMatches.length - 1, searchCursor + 1))} disabled={!searchMatches.length} className="qa-icon-btn" aria-label="下一个匹配">›</button>
+            <button type="button" onClick={() => { setSearchOpen(false); setSearchQuery(""); }} className="qa-icon-btn" aria-label="关闭搜索">×</button>
+          </div>
+          {searchQuery.trim() && (
+            <div style={{ fontSize: 11, opacity: .7 }}>
+              {searchMatches.length ? `找到 ${searchMatches.length} 条，当前第 ${searchCursor + 1} 条；点结果可定位` : "没有找到匹配消息"}
+            </div>
+          )}
+          {searchMatches.length > 0 && (
+            <div className="qa-search-results">
+              {searchMatches.map((match, index) => (
+                <button key={match.sessionId + ":" + match.message.id} type="button" onClick={() => jumpToSearchMatch(index)} aria-current={index === searchCursor ? "true" : undefined} className={`qa-search-result ${index === searchCursor ? "is-active" : ""}`}>
+                  <span style={{ opacity: .55, marginRight: 6 }}>{match.sessionTitle}</span>
+                  {match.message.content.trim().slice(0, 120)}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="qa-body hide-scrollbar" ref={bodyRef} onScroll={handleScroll}>
         {messages.length === 0 ? (
@@ -1271,7 +1371,7 @@ export function PhoneQaApp({ onClose, onNotice }: PhoneQaAppProps) {
             <button
               type="button"
               className={`qa-circle-btn qa-github-btn ${repoConnected ? "is-active" : ""}`}
-              onClick={() => setRepoSheetOpen(true)}
+              onClick={() => { setDrawerOpen(false); setRepoSheetOpen(true); }}
               aria-label="连接仓库"
             >
               <Github size={16} strokeWidth={1.75} />

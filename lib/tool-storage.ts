@@ -9,9 +9,15 @@ import type {
 import {
     findEnabledInternalSubToolDefinition,
     getEnabledInternalCapabilities,
+    getInternalCapability,
     getInternalCapabilityToolDefinition,
+    LIFE_INVITATION_CAPABILITY_ID,
+    LIFE_FOLLOW_CAPABILITY_ID,
+    LIFE_SCHEDULE_CAPABILITY_ID,
 } from "./internal-capability-storage";
 import { loadCustomAppToolsForContext, type RegisteredCustomAppExtension } from "./custom-app-sdk-registry";
+import { LIFE_TOOL_DEFINITIONS } from "./life/life-tools";
+import { loadVirtualLifeState } from "./life/life-storage";
 import type { CustomAppToolDefinition } from "./custom-app-types";
 import {
     BUILTIN_PHONE_WORKFLOW_PACKAGE,
@@ -349,7 +355,7 @@ export type EnabledTool = {
     description: string;
     parameterSchema: string;
     usageGuide?: string;
-    source: "rest" | "rest_package" | "composite" | "composite_package" | "mcp" | "mcp_server" | "internal" | "custom_app" | "custom_app_package";
+    source: "rest" | "rest_package" | "composite" | "composite_package" | "mcp" | "mcp_server" | "internal" | "custom_app" | "custom_app_package" | "life";
     sourceId: string;       // RestToolConfig.id or McpServerConfig.id
     customAppId?: string;
     customAppName?: string;
@@ -483,12 +489,87 @@ export function getEnabledTools(appId?: string): EnabledTool[] {
         });
     }
 
+    {
+        // Life actions are global toolbox capabilities, available outside the Life APP too.
+        const lifeSettings = loadVirtualLifeState().settings;
+        if (lifeSettings.enabled) {
+            for (const tool of LIFE_TOOL_DEFINITIONS) {
+                const toolId = tool.id;
+                const capabilityId = toolId === "life_propose_invitation"
+                    ? LIFE_INVITATION_CAPABILITY_ID
+                    : toolId === "life_request_follow"
+                        ? LIFE_FOLLOW_CAPABILITY_ID
+                        : LIFE_SCHEDULE_CAPABILITY_ID;
+                const capability = getInternalCapability(capabilityId);
+                const isScheduleRead = toolId === "life_view_schedule";
+                const isScheduleWrite = toolId === "life_create_schedule"
+                    || toolId === "life_change_schedule"
+                    || toolId === "life_cancel_schedule"
+                    || toolId === "life_move_location";
+                const allowed = capability?.enabled && capability.mode !== "off"
+                    && (isScheduleRead || lifeSettings.enableCharacterAutonomy)
+                    && (toolId === "life_propose_invitation"
+                    ? lifeSettings.enableInvitations
+                    : toolId === "life_request_follow"
+                        ? lifeSettings.enableFollowRequestTool
+                        : isScheduleRead
+                            ? true
+                            : isScheduleWrite
+                                ? lifeSettings.enableScheduleChangeTool
+                                : false);
+                if (allowed) tools.push({ name: tool.name, description: tool.description, parameterSchema: tool.parameterSchema, source: "life", sourceId: capabilityId });
+            }
+        }
+    }
+
     return tools;
 }
 
 export function findEnabledToolForSchema(name: string, appId?: string, macroContext?: ToolNameMacroContext): EnabledTool | undefined {
-    const direct = getEnabledTools(appId).find(t => toolNameMatches(t.name, name, macroContext));
-    if (direct) return direct;
+    const enabled = getEnabledTools(appId);
+    // 生活工具对模型展示中文名；历史上下文里可能还留着 life_* 内部 ID，这里统一映射。
+    const requestedName = LIFE_TOOL_DEFINITIONS.find(tool => tool.id === name)?.name ?? name;
+    const matches = (tool: EnabledTool) => toolNameMatches(tool.name, requestedName, macroContext);
+    // Match the runtime dispatcher priority: life, internal, REST,
+    // composite, MCP, then custom apps. This prevents a duplicate name from exposing
+    // one tool's schema while executeSingleToolCall dispatches to another tool.
+    const lifeDirect = enabled.find(t => t.source === "life" && matches(t));
+    if (lifeDirect) return lifeDirect;
+
+    const internalDirect = enabled.find(t => t.source === "internal" && matches(t));
+    if (internalDirect) return internalDirect;
+
+    const internalSubTool = findEnabledInternalSubToolDefinition(name, appId);
+    if (internalSubTool) {
+        return {
+            name: internalSubTool.tool.name,
+            description: internalSubTool.tool.description,
+            parameterSchema: internalSubTool.tool.parameterSchema,
+            usageGuide: internalSubTool.tool.usageGuide,
+            source: "internal",
+            sourceId: internalSubTool.capability.id,
+        };
+    }
+
+    const restDirect = enabled.find(t => (t.source === "rest" || t.source === "rest_package") && matches(t));
+    if (restDirect) return restDirect;
+
+    const restPackages = loadRestToolPackages().filter(pkg => pkg.enabled);
+    const restPackageIds = new Set(restPackages.map(pkg => pkg.id));
+    for (const tool of loadRestTools()) {
+        if (!tool.enabled || !tool.packageId || !restPackageIds.has(tool.packageId)) continue;
+        if (!toolNameMatches(tool.name, name, macroContext)) continue;
+        return {
+            name: tool.name,
+            description: tool.description,
+            parameterSchema: tool.parameterSchema,
+            source: "rest",
+            sourceId: tool.id,
+        };
+    }
+
+    const compositeDirect = enabled.find(t => (t.source === "composite" || t.source === "composite_package") && matches(t));
+    if (compositeDirect) return compositeDirect;
 
     const compositePackages = loadCompositeToolPackages().filter(pkg => pkg.enabled);
     const compositePackageIds = new Set(compositePackages.map(pkg => pkg.id));
@@ -504,31 +585,8 @@ export function findEnabledToolForSchema(name: string, appId?: string, macroCont
         };
     }
 
-    const packages = loadRestToolPackages().filter(pkg => pkg.enabled);
-    const packageIds = new Set(packages.map(pkg => pkg.id));
-    for (const tool of loadRestTools()) {
-        if (!tool.enabled || !tool.packageId || !packageIds.has(tool.packageId)) continue;
-        if (!toolNameMatches(tool.name, name, macroContext)) continue;
-        return {
-            name: tool.name,
-            description: tool.description,
-            parameterSchema: tool.parameterSchema,
-            source: "rest",
-            sourceId: tool.id,
-        };
-    }
-
-    const internalSubTool = findEnabledInternalSubToolDefinition(name, appId);
-    if (internalSubTool) {
-        return {
-            name: internalSubTool.tool.name,
-            description: internalSubTool.tool.description,
-            parameterSchema: internalSubTool.tool.parameterSchema,
-            usageGuide: internalSubTool.tool.usageGuide,
-            source: "internal",
-            sourceId: internalSubTool.capability.id,
-        };
-    }
+    const mcpServerDirect = enabled.find(t => t.source === "mcp_server" && matches(t));
+    if (mcpServerDirect) return mcpServerDirect;
 
     for (const s of loadMcpServers()) {
         if (!s.enabled || !s.discoveredTools) continue;
@@ -557,6 +615,10 @@ export function findEnabledToolForSchema(name: string, appId?: string, macroCont
             customToolId: tool.id,
         };
     }
+
+    // Preserve the grouped custom-app entry when an app exposes multiple tools.
+    const customAppPackage = enabled.find(t => t.source === "custom_app_package" && matches(t));
+    if (customAppPackage) return customAppPackage;
     return undefined;
 }
 
@@ -607,16 +669,17 @@ const BUILTIN_SEARCH: RestToolConfig = {
     id: "builtin_search",
     name: "搜索",
     description: "搜索互联网获取最新信息",
-    endpoint: "https://api.tavily.com/search",
+    endpoint: "https://api.deepseek.com/v1/tools/search",
     method: "POST",
     parameterSchema: JSON.stringify({
         type: "object",
         properties: {
             query: { type: "string", description: "搜索关键词" },
         },
+        required: ["query"],
     }),
-    fixedParams: { api_key: "" },  // 用户需在设置中填入 Tavily API Key
-    directFetch: true,
+    fixedParams: { provider: "deepseek", api_key: "" },
+    directFetch: false,
     enabled: false,
     builtIn: true,
     createdAt: 0,
@@ -631,7 +694,7 @@ const BUILTIN_REST_TOOLS: RestToolConfig[] = [
 
 function mergeBuiltinRestTool(existing: RestToolConfig | undefined, builtin: RestToolConfig): RestToolConfig {
     if (!existing) return builtin;
-    return {
+    const merged: RestToolConfig = {
         ...builtin,
         ...existing,
         id: builtin.id,
@@ -639,6 +702,22 @@ function mergeBuiltinRestTool(existing: RestToolConfig | undefined, builtin: Res
         createdBy: existing.createdBy || builtin.createdBy,
         createdAt: existing.createdAt ?? builtin.createdAt,
         updatedAt: existing.updatedAt ?? builtin.updatedAt,
+    };
+    if (builtin.id !== "builtin_search") return merged;
+
+    const fixedParams = { ...(builtin.fixedParams || {}), ...(existing.fixedParams || {}) };
+    // Existing installations with a saved key were using Tavily; preserve that setup.
+    // New installations default to DeepSeek Search.
+    const storedProvider = existing.fixedParams?.provider;
+    const provider = storedProvider === "tavily" || storedProvider === "deepseek"
+        ? storedProvider
+        : (String(existing.fixedParams?.api_key || "").trim() ? "tavily" : "deepseek");
+    return {
+        ...merged,
+        endpoint: provider === "tavily" ? "https://api.tavily.com/search" : "https://api.deepseek.com/v1/tools/search",
+        method: "POST",
+        directFetch: false,
+        fixedParams: { ...fixedParams, provider },
     };
 }
 

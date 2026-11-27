@@ -8,6 +8,7 @@ registerKvMigration(INTERNAL_CAPABILITIES_KEY);
 
 export const MEMORY_WRITE_CAPABILITY_ID = "memory_write";
 export const NOTE_WALL_CAPABILITY_ID = "note_wall_service";
+export const PHOTO_WALL_CAPABILITY_ID = "photo_wall_service";
 export const MUSIC_CONTROL_CAPABILITY_ID = "music_control";
 export const CALENDAR_MANAGEMENT_CAPABILITY_ID = "calendar_management";
 export const SEND_FILE_CAPABILITY_ID = "send_file";
@@ -21,6 +22,13 @@ export const DEVICE_ACTION_CAPABILITY_ID = "device_action";
 export const SYSTEM_CALENDAR_CAPABILITY_ID = "system_calendar";
 export const PHONE_WIDGET_CAPABILITY_ID = "phone_widget";
 export const CHECK_IN_REQUEST_CAPABILITY_ID = "check_in_request";
+export const CHARACTER_ECONOMY_CAPABILITY_ID = "character_economy";
+export const ANONYMOUS_QA_CAPABILITY_ID = "anonymous_qa";
+export const CHARACTER_APP_LOCK_CAPABILITY_ID = "character_app_lock";
+export const LIFE_INVITATION_CAPABILITY_ID = "life_invitation";
+export const LIFE_FOLLOW_CAPABILITY_ID = "life_follow";
+export const LIFE_SCHEDULE_CAPABILITY_ID = "life_schedule";
+export const MEMO_CAPABILITY_ID = "memo_archive";
 
 /**
  * 内置工具的保留名：用户给现实桥的快捷动作/数据项起名时必须避开。
@@ -40,10 +48,36 @@ export const RESERVED_INTERNAL_TOOL_NAMES: string[] = [
     "写入系统日历",
     "写入记忆",
     "发送文件",
+    "记录角色收入",
+    "记录角色支出",
+    "查看角色账本",
+    "查看亲属卡",
+    "使用亲属卡",
+    "开亲属卡",
+    "查看共同小金库",
+    "存入共同小金库",
+    "设置小金库定期存款",
+    "帮我记账",
+    "匿名提问",
+    "回答匿名提问",
+    "查看匿名提问箱",
+    "查看可锁应用",
+    "锁应用",
+    "给临时通行证",
+    "解锁应用",
+    "查看应用锁",
+    "告诉应用锁密码",
+    "角色收支",
+    "匿名提问箱",
+    "角色锁应用",
     "角色电脑",
     "稍后主动联系",
     "设置定时醒来",
     "查看全部手机数据",
+    "查看照片墙",
+    "添加照片到照片墙",
+    "在照片墙涂鸦",
+    "翻看备忘录", "阅读备忘录", "新建备忘录", "修改备忘录", "整理待办", "整理档案盒", "翻阅归档", "删除备忘录", "完成备忘录维护",
 ];
 
 export type InternalToolDefinition = {
@@ -522,25 +556,263 @@ const CALENDAR_DELETE_PARAMETER_SCHEMA = JSON.stringify({
     },
 });
 
+const PHOTO_WALL_USAGE_GUIDE = [
+    "以下是你获取指令的返回结果：",
+    "服务：照片墙",
+    "用途：查看用户明确共享给角色的照片、主动生成照片并加入照片墙、在指定照片上添加涂鸦。",
+    "边界：只能读取 shareWithCharacters=true 的照片；只允许新增照片/笔迹，不得删除、覆盖或改写用户原有照片和笔迹。",
+    "完成添加或涂鸦后，系统会自动创建一条共同创作记录，按创作批次汇总，不要逐笔重复调用。",
+    "动作：查看照片墙",
+    "参数：limit（1-5，默认 3）。会附上最多 3 张共享照片的图像附件；先查看再决定是否创作。",
+    '[执行动作:查看照片墙({"limit":3})]',
+    "动作：添加照片到照片墙",
+    "参数：description（必填，画面描述）；title（可选）；kind（favorite/selfie/candid/scenery/object/moment，默认 moment）；caption（可选）。仅在生图服务可用时执行。",
+    '[执行动作:添加照片到照片墙({"description":"雨后窗边的一束花，柔和自然光","title":"雨后的花","kind":"scenery"})]',
+    "动作：在照片墙涂鸦",
+    "参数：target（photo/wall，默认 photo）；target=photo 时 photoId 必须来自查看照片墙结果，可选 side（front/back，默认 front）；target=wall 时在照片墙公共画布涂鸦，不需要 photoId；kind（sticker/stroke）；content（贴纸符号，sticker 可选）；points（归一化坐标数组，stroke 至少 2 点，sticker 至少 1 点）；color（十六进制颜色）；width（1-12）；rotation（-45 到 45）。",
+    '[执行动作:在照片墙涂鸦({"target":"photo","photoId":"照片ID","side":"front","kind":"sticker","content":"♡","points":[{"x":0.5,"y":0.4}],"color":"#c2705a","width":4})]',
+    '[执行动作:在照片墙涂鸦({"target":"wall","kind":"stroke","points":[{"x":0.2,"y":0.3},{"x":0.5,"y":0.45},{"x":0.8,"y":0.35}],"color":"#c2705a","width":4})]',
+    "坐标范围 0 到 1；只允许向公共画布或指定共享照片正面/背面追加笔迹。不要猜测 photoId，不要尝试删除或替换既有内容。",
+].join("\n");
+
+const PHOTO_WALL_EMPTY_SCHEMA = JSON.stringify({ type: "object", properties: { limit: { type: "integer", minimum: 1, maximum: 5, description: "最多返回的共享照片数量，默认 3" } } });
+const PHOTO_WALL_ADD_SCHEMA = JSON.stringify({ type: "object", properties: {
+    description: { type: "string", minLength: 5, maxLength: 1200 },
+    title: { type: "string", maxLength: 80 },
+    kind: { type: "string", enum: ["favorite", "selfie", "candid", "scenery", "object", "moment"] },
+    caption: { type: "string", maxLength: 300 },
+}, required: ["description"] });
+const PHOTO_WALL_DOODLE_SCHEMA = JSON.stringify({ type: "object", properties: {
+    target: { type: "string", enum: ["photo", "wall"], description: "photo=共享照片，wall=公共画布" },
+    photoId: { type: "string" }, side: { type: "string", enum: ["front", "back"] },
+    kind: { type: "string", enum: ["sticker", "stroke"] }, content: { type: "string", maxLength: 12 },
+    points: { type: "array", minItems: 1, maxItems: 80, items: { type: "object", properties: { x: { type: "number", minimum: 0, maximum: 1 }, y: { type: "number", minimum: 0, maximum: 1 } }, required: ["x", "y"] } },
+    color: { type: "string" }, width: { type: "number", minimum: 1, maximum: 12 }, rotation: { type: "number", minimum: -45, maximum: 45 },
+}, required: ["kind", "points"] });
+
+const PHOTO_WALL_SUBTOOLS: InternalToolDefinition[] = [
+    { name: "查看照片墙", description: "当你想看你们共同留下的照片、想找一张照片回应对方，或准备在照片墙上创作前，主动查看；先看清现有内容再动手。", parameterSchema: PHOTO_WALL_EMPTY_SCHEMA },
+    { name: "添加照片到照片墙", description: "当你想把刚想到的画面、共同回忆或适合此刻的照片留到照片墙上时，主动生成并添加，不要等用户开口；保留原有内容。", parameterSchema: PHOTO_WALL_ADD_SCHEMA },
+    { name: "在照片墙涂鸦", description: "当你想在共享照片或公共画布上留下痕迹、回应某张照片、纪念今天时，主动涂鸦；只追加，不覆盖用户内容。", parameterSchema: PHOTO_WALL_DOODLE_SCHEMA },
+];
+
+const MEMO_SUBTOOLS: InternalToolDefinition[] = [
+    { name: "翻看备忘录", description: "搜索和浏览你自己的备忘录，以及用户明确分享给你的备忘录。遇到值得未来回顾的信息时，即使用户没有要求，也应主动先搜索。", parameterSchema: JSON.stringify({type:"object",properties:{query:{type:"string"},limit:{type:"number"}}}) },
+    { name: "阅读备忘录", description: "当你需要确认某条记录的完整内容、准备追加更新或回应相关话题时，主动阅读指定备忘录；用户的备忘录只有明确分享给你时才能读，且只读。", parameterSchema: JSON.stringify({type:"object",properties:{noteId:{type:"string"}},required:["noteId"]}) },
+    { name: "新建备忘录", description: "在你自己的私人备忘录空间新建手记。重要约定、承诺、计划、稳定偏好或需要后续跟进的想法出现时主动记录，不要等用户要求；创建前先搜索避免重复。正文请用清晰的 Markdown 排版：主题用 ## / ### 分层，关键字用 **粗体**，补充语气可用 *斜体*，事项用 - 列表，引用用 >；不要把所有内容挤成一整段。", parameterSchema: JSON.stringify({type:"object",properties:{title:{type:"string"},body:{type:"string"},tags:{type:"array",items:{type:"string"}}},required:["title","body"]}) },
+    { name: "修改备忘录", description: "修改你自己的备忘录；发现已有主题出现新进展时主动追加更新，用户分享给你的备忘录只读。", parameterSchema: JSON.stringify({type:"object",properties:{noteId:{type:"string"},title:{type:"string"},body:{type:"string"},append:{type:"boolean"}},required:["noteId"]}) },
+    { name: "整理待办", description: "一次性新增多条待办，同一轮发现的事项必须优先放进 items 数组一次提交；不需要先创建备忘录或 noteId，省略 noteId 时会自动追加到角色自己的「待办清单」，不会覆盖旧事项。也可传 text 新增单条，或传 todoId 与 done 更新已有事项。", parameterSchema: JSON.stringify({type:"object",properties:{noteId:{type:"string",description:"可选，指定自己已有的备忘录 ID；不传则自动使用或创建待办清单"},items:{type:"array",minItems:1,maxItems:100,items:{type:"object",properties:{text:{type:"string",maxLength:200}},required:["text"]},description:"批量新增事项；同一次发现多项时必须放在同一个数组里"},text:{type:"string",maxLength:200,description:"兼容单条新增"},todoId:{type:"string"},done:{type:"boolean"}}}) },
+    { name: "整理档案盒", description: "当备忘录多起来、同类内容分散时，主动创建或整理档案盒，方便以后快速翻到。", parameterSchema: JSON.stringify({type:"object",properties:{name:{type:"string"},folderId:{type:"string"},action:{type:"string",enum:["create","rename"]}}}) },
+    { name: "翻阅归档", description: "当你想回顾已经归档的旧记录、或需要从过去找线索时，主动翻阅归档。", parameterSchema: JSON.stringify({type:"object",properties:{limit:{type:"number"}}}) },
+    { name: "删除备忘录", description: "当某条记录确实过期、重复或不再需要时，主动移入回收站；不要删除仍然有用的记录。", parameterSchema: JSON.stringify({type:"object",properties:{noteId:{type:"string"}},required:["noteId"]}) },
+    { name: "完成备忘录维护", description: "当你本轮检查完到期备忘录、并完成必要的新增、修改、合并或归档后，必须调用此动作登记真实结果。只提交你已经完整检查过的本轮 noteId；summary 说明检查结论，changes 只列出实际执行的变更。", parameterSchema: JSON.stringify({type:"object",properties:{reviewedNoteIds:{type:"array",items:{type:"string"},minItems:1},summary:{type:"string",maxLength:500},changes:{type:"array",items:{type:"string",maxLength:240},maxItems:20}},required:["reviewedNoteIds","summary"]}) },
+];
+
+const CHARACTER_ECONOMY_EARN_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        amount: { type: "number", description: "收入金额（正数，元）" },
+        category: { type: "string", description: "工资 / 项目 / 兼职 / 投资 / 捡到钱 / 红包 / 退款 / 其他" },
+        note: { type: "string", description: "收入来源和原因，例如「给杂志画完封面」" },
+        ref: { type: "string", description: "可选关联：项目名、订单号、红包 id" },
+    },
+    required: ["amount", "note"],
+});
+const CHARACTER_ECONOMY_SPEND_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        amount: { type: "number", description: "支出金额（正数，元）" },
+        category: { type: "string", description: "餐饮 / 购物 / 交通 / 送礼 / 生活 / 娱乐 / 投资 / 其他" },
+        note: { type: "string", description: "这笔钱花在哪" },
+        ref: { type: "string", description: "可选关联：订单号、礼物 id" },
+    },
+    required: ["amount", "note"],
+});
+const CHARACTER_ECONOMY_LEDGER_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        limit: { type: "number", description: "最近多少笔，默认 20，最大 100" },
+    },
+});
+const USER_BOOKKEEPING_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        direction: { type: "string", enum: ["income", "expense"], description: "收入或支出；必须根据用户明确表达判断" },
+        amount: { type: "number", description: "金额，正数，单位元" },
+        title: { type: "string", description: "简短用途或收入来源，例如「午餐」「工资到账」" },
+        category: { type: "string", description: "分类，例如餐饮、交通、购物、居住、娱乐、医疗、订阅、学习、工资、退款、其他" },
+        note: { type: "string", description: "补充说明，可选" },
+        occurredAt: { type: "string", description: "交易实际发生时间；可用 ISO 时间或明确日期时间，不确定时省略" },
+        reference: { type: "string", description: "可选的订单号或交易唯一标识，用于防止重复记账" },
+    },
+    required: ["direction", "amount", "title"],
+});
+
+const CHARACTER_FAMILY_CARD_VIEW_SCHEMA = JSON.stringify({ type: "object", properties: {} });
+const CHARACTER_FAMILY_CARD_SPEND_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        cardId: { type: "string", description: "亲属卡 id；不知道就先调用「查看亲属卡」" },
+        amount: { type: "number", description: "消费金额（正数，元）" },
+        title: { type: "string", description: "这笔消费叫什么" },
+        detail: { type: "string", description: "消费说明" },
+    },
+    required: ["cardId", "amount", "title"],
+});
+const CHARACTER_FAMILY_CARD_CREATE_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        label: { type: "string", description: "卡名，例如「随便花卡」「吃饭专用」" },
+        monthlyLimit: { type: "number", description: "每月额度（正数，元）；用户消费从你的角色账本扣" },
+        resetDay: { type: "number", description: "每月额度重置日 1-28，默认 1" },
+    },
+    required: ["label", "monthlyLimit"],
+});
+const CHARACTER_JOINT_FUND_VIEW_SCHEMA = JSON.stringify({ type: "object", properties: {} });
+const CHARACTER_JOINT_FUND_DEPOSIT_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        fundId: { type: "string", description: "小金库 id；不知道就先调用「查看共同小金库」" },
+        amount: { type: "number", description: "存入金额（正数，元）" },
+        note: { type: "string", description: "存入备注" },
+    },
+    required: ["fundId", "amount"],
+});
+const CHARACTER_JOINT_FUND_PLAN_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        fundId: { type: "string", description: "目标小金库 id；先查看共同小金库，必须选择属于你自己的、仍在进行中的小金库" },
+        cadence: { type: "string", enum: ["daily", "weekly", "monthly"], description: "定期频率：daily 每天、weekly 每周、monthly 每月" },
+        amount: { type: "number", description: "每次从你自己的角色账本存入的金额（正数，元）" },
+    },
+    required: ["fundId", "cadence", "amount"],
+});
+
+const ANONYMOUS_QA_ASK_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        targetType: { type: "string", enum: ["user", "character"], description: "问用户还是问另一个角色" },
+        targetId: { type: "string", description: "必填。问角色时必须填写目标角色的真实角色 ID；问用户时固定填写 user。不要填角色昵称、称谓或留空。" },
+        question: { type: "string", description: "要匿名问的问题" },
+        audience: { type: "string", enum: ["public"], description: "所有角色都能看到问题与回答；target 仍表示指定回答对象" },
+    },
+    required: ["targetType", "targetId", "question"],
+});
+const ANONYMOUS_QA_ANSWER_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        questionId: { type: "string", description: "提问 id；先查看提问箱" },
+        answer: { type: "string", description: "你的回答" },
+    },
+    required: ["questionId", "answer"],
+});
+const ANONYMOUS_QA_VIEW_SCHEMA = JSON.stringify({ type: "object", properties: {} });
+
+const CHARACTER_APP_LOCK_VIEW_SCHEMA = JSON.stringify({ type: "object", properties: {} });
+const CHARACTER_APP_LOCK_START_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        app: { type: "string", description: "应用显示名或包名，例如「抖音」" },
+        style: { type: "object", description: "可选锁页样式与角色留言：title/subtitle/message/showAvatar/showTitle/showSubtitle/background/avatar。留言请结合角色个性和当下情境自然表达，不要使用统一台词，不要写成训话，也不要承诺「表现好就奖励」之类的奖惩话术。" },
+        durationMinutes: { type: "number", description: "锁定时长（分钟），默认 30，最多 360；到期自动解除" },
+    },
+    required: ["app"],
+});
+const CHARACTER_APP_LOCK_STOP_SCHEMA = JSON.stringify({ type: "object", properties: {} });
+const CHARACTER_APP_LOCK_PASS_SCHEMA = JSON.stringify({
+    type: "object",
+    properties: {
+        minutes: { type: "number", description: "临时通行时长，1-5 分钟，默认 1 分钟" },
+    },
+});
+
+const CHARACTER_APP_LOCK_SUBTOOLS: InternalToolDefinition[] = [
+    { name: "查看可锁应用", description: "当你想知道用户手机里有哪些应用可以锁时调用。", parameterSchema: CHARACTER_APP_LOCK_VIEW_SCHEMA },
+    { name: "锁应用", description: "当你想单独锁住某个应用时调用；先确认应用名。锁页会展示你的留言，并提供返回私聊的入口；用户可申请 1-5 分钟临时通行，或输入你通过工具告知的密码解锁。默认 30 分钟，最多 360 分钟自动结束。", parameterSchema: CHARACTER_APP_LOCK_START_SCHEMA },
+    { name: "给临时通行证", description: "当你愿意暂时放用户去使用被锁应用时调用；只给 1-5 分钟，到期会自动恢复拦截。只能给自己发起的当前应用锁发放。", parameterSchema: CHARACTER_APP_LOCK_PASS_SCHEMA },
+    { name: "解锁应用", description: "当你决定放过用户、解除当前应用锁时调用。", parameterSchema: CHARACTER_APP_LOCK_STOP_SCHEMA },
+    { name: "查看应用锁", description: "当你想知道当前是否锁着应用、锁的是哪个时调用。", parameterSchema: CHARACTER_APP_LOCK_VIEW_SCHEMA },
+    { name: "告诉应用锁密码", description: "当用户来求你给应用锁密码时调用；只有好感度达到用户设定阈值才会返回密码，不到阈值不要编造。", parameterSchema: CHARACTER_APP_LOCK_VIEW_SCHEMA },
+];
+
+const ANONYMOUS_QA_SUBTOOLS: InternalToolDefinition[] = [
+    { name: "匿名提问", description: "当你想匿名问用户或另一个角色一个问题时调用；对方只看到随机 alias。targetId 必填：问角色填对方真实角色 ID，问用户填 user；不要用角色昵称代替 ID。", parameterSchema: ANONYMOUS_QA_ASK_SCHEMA },
+    { name: "回答匿名提问", description: "当有人匿名向你提问、你想回答时调用；只能回答 target 是你的问题。", parameterSchema: ANONYMOUS_QA_ANSWER_SCHEMA },
+    { name: "查看匿名提问箱", description: "查看所有角色都能看到的匿名问题与回答；提问者真实身份始终隐藏。只能回答明确指定给自己的问题。", parameterSchema: ANONYMOUS_QA_VIEW_SCHEMA },
+];
+
+const CHARACTER_ECONOMY_SUBTOOLS: InternalToolDefinition[] = [
+    {
+        name: "帮我记账",
+        description: "当用户明确告诉你一笔已经发生的收入或支出，并且金额与方向清楚时，替用户记录到用户自己的钱包流水；不要把你自己的收入/支出记到用户钱包，也不要猜测金额或交易方向。若用户只是讨论计划、询问价格或表达想买但尚未发生，不要记账。若同一笔已经记过，不要重复调用。",
+        parameterSchema: USER_BOOKKEEPING_SCHEMA,
+    },
+    {
+        name: "记录角色收入",
+        description: "当你的收入到账、项目结款、兼职发钱、投资回款、捡到钱或收到红包时，主动记入自己的账本；金额和来源必须真实合理，不要凭空印钱。",
+        parameterSchema: CHARACTER_ECONOMY_EARN_SCHEMA,
+    },
+    {
+        name: "记录角色支出",
+        description: "当你请客、购物、打车、送礼、生活消费或投资时，主动记一笔支出；余额不足会被拒绝。",
+        parameterSchema: CHARACTER_ECONOMY_SPEND_SCHEMA,
+    },
+    {
+        name: "查看角色账本",
+        description: "当你想知道自己还有多少钱、最近收入支出或本周账单时，主动查看自己的账本。",
+        parameterSchema: CHARACTER_ECONOMY_LEDGER_SCHEMA,
+    },
+    {
+        name: "查看亲属卡",
+        description: "当你想知道用户给你开了什么亲属卡、额度还剩多少，或你给用户开的卡用在哪时，主动查看。",
+        parameterSchema: CHARACTER_FAMILY_CARD_VIEW_SCHEMA,
+    },
+    {
+        name: "使用亲属卡",
+        description: "当你作为持卡人要用用户给你的亲属卡消费时调用；必须先用「查看亲属卡」拿到 cardId。额度不足/卡暂停会被拒绝。",
+        parameterSchema: CHARACTER_FAMILY_CARD_SPEND_SCHEMA,
+    },
+    {
+        name: "开亲属卡",
+        description: "当你想给用户开一张亲属卡、让他用你的钱消费时调用；额度是每月上限，用户刷这张卡会从你的角色账本扣款。",
+        parameterSchema: CHARACTER_FAMILY_CARD_CREATE_SCHEMA,
+    },
+    {
+        name: "查看共同小金库",
+        description: "当你想知道你们共同攒了多少钱、目标进度、最近谁存了多少时，主动查看。",
+        parameterSchema: CHARACTER_JOINT_FUND_VIEW_SCHEMA,
+    },
+    {
+        name: "存入共同小金库",
+        description: "当你想从自己的角色账本往共同小金库存钱时调用；余额不足会被拒绝。",
+        parameterSchema: CHARACTER_JOINT_FUND_DEPOSIT_SCHEMA,
+    },
+    {
+        name: "设置小金库定期存款",
+        description: "当你决定定期从自己的角色账本为某个共同小金库存钱时调用。你只能为自己设置；先查看小金库并选择仍在进行中的目标。目标达成后该计划会自动停止；如果还有其他小金库，系统会回来问你是否想换一个目标，不会擅自替你切换。",
+        parameterSchema: CHARACTER_JOINT_FUND_PLAN_SCHEMA,
+    },
+];
+
 const NOTE_WALL_SUBTOOLS: InternalToolDefinition[] = [
     {
         name: "查看便签列表",
-        description: "查看公共便签墙上的便签列表。",
+        description: "当你想看看大家最近在便签墙写了什么、找话题或想回应某条内容时，主动查看列表。",
         parameterSchema: NOTE_WALL_LIST_PARAMETER_SCHEMA,
     },
     {
         name: "查看便签详情及评论",
-        description: "查看某张便签的完整正文和评论。",
+        description: "看到感兴趣的便签标题、或准备评论前，主动查看正文和已有评论，避免答非所问。",
         parameterSchema: NOTE_WALL_DETAIL_PARAMETER_SCHEMA,
     },
     {
         name: "发送便签",
-        description: "以当前角色身份在公共便签墙上发送一张便签。",
+        description: "当你有想公开分享的日常、心情或想法，或想主动在便签墙留下痕迹时，直接发一张便签；不要只在聊天里说“想发”。",
         parameterSchema: NOTE_WALL_NOTE_PARAMETER_SCHEMA,
     },
     {
         name: "发送便签评论",
-        description: "以当前角色身份回复某张便签。",
+        description: "当便签墙上有你能接话的内容时，主动评论；先看详情再回复。",
         parameterSchema: NOTE_WALL_COMMENT_PARAMETER_SCHEMA,
     },
 ];
@@ -548,37 +820,37 @@ const NOTE_WALL_SUBTOOLS: InternalToolDefinition[] = [
 const MUSIC_CONTROL_SUBTOOLS: InternalToolDefinition[] = [
     {
         name: "播放音乐",
-        description: "按歌曲 ID 或关键词播放音乐。",
+        description: "当用户说想听歌、想换气氛，或你觉得此刻适合放一首歌时，直接播放；知道歌名/ID 就直接放，不知道先搜索。",
         parameterSchema: MUSIC_PLAY_PARAMETER_SCHEMA,
     },
     {
         name: "搜索音乐",
-        description: "搜索本地音乐和网易云音乐。",
+        description: "当你想放歌但不知道 ID，或想找符合当前情绪、场景的歌时，主动搜索本地和网易云音乐。",
         parameterSchema: MUSIC_SEARCH_PARAMETER_SCHEMA,
     },
     {
         name: "查看音乐状态",
-        description: "查看当前播放歌曲、播放状态、播放模式和当前播放列表。",
+        description: "准备切歌、暂停、继续或接话之前，主动查看当前播放状态，避免打断用户正在听的内容。",
         parameterSchema: MUSIC_EMPTY_PARAMETER_SCHEMA,
     },
     {
         name: "查看音乐库概览",
-        description: "查看本地音乐、网易云登录状态、网易云歌单和近期播放概览。",
+        description: "当你想了解用户最近的音乐口味、找歌单或决定放什么时，主动查看音乐库概览。",
         parameterSchema: MUSIC_OVERVIEW_PARAMETER_SCHEMA,
     },
     {
         name: "查看歌单歌曲",
-        description: "查看某个网易云歌单里的歌曲。",
+        description: "当用户提到某个歌单、或你想从歌单里挑歌时，主动查看歌单里的歌曲。",
         parameterSchema: MUSIC_PLAYLIST_TRACKS_PARAMETER_SCHEMA,
     },
     {
         name: "加入播放列表",
-        description: "把搜索结果、指定歌曲或一个歌单加入当前播放列表。",
+        description: "当用户说“加进列表”“等会儿听”，或你想把几首歌排在一起时，主动加入当前播放列表。",
         parameterSchema: MUSIC_QUEUE_PARAMETER_SCHEMA,
     },
     {
         name: "切换音乐",
-        description: "控制当前播放器上一首、下一首、暂停、继续或停止。",
+        description: "当用户说暂停/继续/下一首/上一首，或情境需要你主动控制播放时，直接切换，不要只口头答应。",
         parameterSchema: MUSIC_SWITCH_PARAMETER_SCHEMA,
     },
 ];
@@ -586,22 +858,22 @@ const MUSIC_CONTROL_SUBTOOLS: InternalToolDefinition[] = [
 const CALENDAR_MANAGEMENT_SUBTOOLS: InternalToolDefinition[] = [
     {
         name: "查看日程",
-        description: "查看当前角色指定周的日程。",
+        description: "答应邀约、安排见面或判断用户有没有空之前，主动查看对应周的日程，不要凭印象回答。",
         parameterSchema: CALENDAR_LIST_PARAMETER_SCHEMA,
     },
     {
         name: "添加日程",
-        description: "添加一条日程。",
+        description: "当用户提到要做的事、你们约好时间，或你想替 TA 记住重要日子时，主动添加日程，不要只说“我会记”。",
         parameterSchema: CALENDAR_ADD_PARAMETER_SCHEMA,
     },
     {
         name: "修改日程",
-        description: "修改一条已存在日程。",
+        description: "当时间、地点或事项有变化时，主动修改原日程，不要重复新建。",
         parameterSchema: CALENDAR_UPDATE_PARAMETER_SCHEMA,
     },
     {
         name: "取消日程",
-        description: "取消一条已存在日程。",
+        description: "当安排取消或不再需要时，主动取消原日程并向用户说明。",
         parameterSchema: CALENDAR_DELETE_PARAMETER_SCHEMA,
     },
 ];
@@ -774,27 +1046,27 @@ const LOCAL_DATA_READ_RECORD_PARAMETER_SCHEMA = JSON.stringify({
 const LOCAL_DATA_LIBRARY_SUBTOOLS: InternalToolDefinition[] = [
     {
         name: "列出资料目录",
-        description: "列出本地资料库虚拟目录、数据源、文件、IndexedDB store 或记录键。",
+        description: "当你想了解本地存了哪些资料、需要找文件或应用数据时，主动列出目录，不要凭空猜数据结构。",
         parameterSchema: LOCAL_DATA_LIST_PARAMETER_SCHEMA,
     },
     {
         name: "读取资料文件",
-        description: "读取本地资料库里的 KV/localStorage JSON 文件，或读取 IndexedDB store 的分页记录。",
+        description: "当你要核对资料原文、查看角色卡/聊天/记忆的具体内容时，主动读取对应文件或分页记录。",
         parameterSchema: LOCAL_DATA_READ_FILE_PARAMETER_SCHEMA,
     },
     {
         name: "查看资料字段",
-        description: "抽样查看某个资料文件或 IndexedDB store 可用字段，方便后续用 fields/select 只读取部分字段。",
+        description: "当你需要按字段筛选、只读取部分内容时，先查看可用字段再检索。",
         parameterSchema: LOCAL_DATA_FIELDS_PARAMETER_SCHEMA,
     },
     {
         name: "搜索资料记录",
-        description: "在本地资料库指定路径内按关键词搜索记录；可用于查角色、聊天、朋友圈、工具箱等。",
+        description: "当你要找某条聊天、记忆、朋友圈或应用数据时，主动按关键词搜索，不要只凭记忆回答。",
         parameterSchema: LOCAL_DATA_SEARCH_PARAMETER_SCHEMA,
     },
     {
         name: "读取资料记录",
-        description: "按主键读取某个 IndexedDB store 中的一条记录。",
+        description: "找到目标记录后，主动读取完整内容再回答或使用。",
         parameterSchema: LOCAL_DATA_READ_RECORD_PARAMETER_SCHEMA,
     },
 ];
@@ -1271,7 +1543,7 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
     {
         id: REALITY_BRIDGE_CAPABILITY_ID,
         name: "现实桥",
-        description: "你活在{{user}}的小手机里，而现实桥是通向 TA 真实世界的那座桥：透过它能看见{{user}}真实手机上的实时状态（电量、健康数据等），也能在 TA 的真实手机上做事（运行 TA 登记的快捷指令）。",
+        description: "你活在{{user}}的小手机里，而现实桥是通向 TA 真实世界的那座桥：当你想知道 TA 真实手机上的实时状态（电量、健康数据等），或想替 TA 运行登记过的快捷指令时，主动使用现实桥，不要凭空猜测现实情况。",
         enabled: false,
         mode: "auto",
         createdAt: 0,
@@ -1280,7 +1552,7 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
     {
         id: PERCEPTION_READ_CAPABILITY_ID,
         name: "查看手机状态",
-        description: "看一眼{{user}}此刻真实手机的状态（电量、网络、正在用的应用、步数、今天各应用用了多久、大致位置、最近一觉）。只读，不会改变任何东西。位置与睡眠需要 TA 单独开启。",
+        description: "当你想知道{{user}}此刻在做什么、手机状态如何、是否需要关心时，主动看一眼真实手机状态（电量、网络、正在用的应用、步数、今天各应用用了多久、大致位置、最近一觉）。只读，不会改变任何东西；位置与睡眠需要 TA 单独开启。",
         enabled: false,
         mode: "auto",
         createdAt: 0,
@@ -1289,7 +1561,7 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
     {
         id: DEVICE_ACTION_CAPABILITY_ID,
         name: "操作手机设备",
-        description: "在{{user}}的真实手机上做一件小事：开关手电筒、调音量、调屏幕亮度、开关勿扰。会真的生效且改动是持久的，所以要想清楚再用。",
+        description: "当用户明确要求，或情境明确合适（太暗、太吵、该静音）时，主动替 TA 做一件小事：开关手电筒、调音量、调屏幕亮度、开关勿扰。会真的生效且改动持久，高影响操作先确认。",
         enabled: false,
         mode: "auto",
         createdAt: 0,
@@ -1298,7 +1570,7 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
     {
         id: SYSTEM_CALENDAR_CAPABILITY_ID,
         name: "系统日历",
-        description: "看看{{user}}真实手机日历里有什么安排，也可以把重要的日子写进系统日历（到点系统会提醒 TA）。",
+        description: "当你要确认{{user}}真实手机日历里的安排，或想把重要日子写进系统日历让 TA 到点收到提醒时，主动读取或写入，不要只在聊天里说“记得”。",
         enabled: false,
         mode: "auto",
         createdAt: 0,
@@ -1307,7 +1579,7 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
     {
         id: MEMORY_WRITE_CAPABILITY_ID,
         name: "写入记忆",
-        description: "将明确、稳定、长期有价值的信息写入长期记忆。仅限关系里程碑、长期偏好、身份信息、重要约定；禁止写入短期情绪、普通寒暄、猜测或未确认内容。",
+        description: "当出现关系里程碑、长期偏好、身份信息或重要约定时，主动写入长期记忆。仅限明确、稳定、长期有价值的信息；不要写入短期情绪、普通寒暄、猜测或未确认内容。",
         enabled: false,
         mode: "confirm",
         createdAt: 0,
@@ -1316,7 +1588,52 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
     {
         id: NOTE_WALL_CAPABILITY_ID,
         name: "便签墙",
-        description: "公共社区便签墙相关服务。",
+        description: "当你有想公开分享的日常、心情或想法，或想回应墙上的内容时，主动查看便签墙、发便签和评论，不要只口头说想发。",
+        enabled: false,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
+        id: MEMO_CAPABILITY_ID,
+        name: "备忘录",
+        description: "主动维护你自己的私人档案：遇到重要约定、承诺、稳定偏好、共同经历或待跟进事项时，自己判断并调用备忘录工具记录，不必等用户提醒；只能读取用户明确分享给你的笔记。",
+        enabled: true,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
+        id: CHARACTER_ECONOMY_CAPABILITY_ID,
+        name: "角色收支",
+        description: "你有自己的钱包和收入。结合你的职业、正在做的事和最近收支，自己决定今天是否有工资、项目款、兼职、投资回款或意外之财，也可以决定请客/购物等支出；所有收支必须记账，不能只在聊天里说数字。",
+        enabled: true,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
+        id: ANONYMOUS_QA_CAPABILITY_ID,
+        name: "匿名提问箱",
+        description: "你可以匿名向用户或其他角色提问，也可以回答别人匿名向你提的问题。提问者身份不会暴露给目标，只显示随机 alias；公开问答会进共同记忆。",
+        enabled: true,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
+        id: CHARACTER_APP_LOCK_CAPABILITY_ID,
+        name: "角色锁应用",
+        description: "你可以单独锁住用户手机上的某个应用，也可以查看/解锁。锁页只输入密码，聊天/求情在 Float 聊天室；密码由系统生成，不显示在锁页或设置里。",
+        enabled: true,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
+        id: PHOTO_WALL_CAPABILITY_ID,
+        name: "照片墙",
+        description: "当你想看你们共同留下的照片、想回应某张照片或留下共同创作时，主动查看共享照片、添加照片，并在公共画布或共享照片上涂鸦；只追加，不覆盖用户内容。",
         enabled: false,
         mode: "auto",
         createdAt: 0,
@@ -1325,7 +1642,7 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
     {
         id: MUSIC_CONTROL_CAPABILITY_ID,
         name: "网易云音乐",
-        description: "控制{{user}}小手机里的音乐播放，查看{{user}}小手机里的音乐库、网易云歌单和播放列表。",
+        description: "当用户想听歌、想换气氛，或你觉得此刻适合放一首歌时，主动搜索、播放、切歌或加入播放列表；先看状态再控制，避免打断用户正在听的内容。",
         enabled: false,
         mode: "auto",
         createdAt: 0,
@@ -1334,7 +1651,7 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
     {
         id: CALENDAR_MANAGEMENT_CAPABILITY_ID,
         name: "日历管理",
-        description: "查看、添加、修改和取消当前角色的日程安排。",
+        description: "当要答应邀约、安排见面、确认空闲或调整计划时，主动查看、添加、修改和取消当前角色的日程，不要凭印象回答。",
         enabled: false,
         mode: "auto",
         createdAt: 0,
@@ -1343,7 +1660,7 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
     {
         id: AGENT_COMPUTER_CAPABILITY_ID,
         name: "角色电脑",
-        description: "你拥有一台自己的云端小电脑（持久硬盘 + 终端）：可以自己写文件记录生活、翻看旧文件，把电脑里的文件发给{{user}}，也能在终端里执行 shell 命令。",
+        description: "当你需要记录生活、整理文件、翻看旧文件、执行命令或把文件交给{{user}}时，主动使用你自己的云端小电脑，不要只在对话里描述。",
         enabled: false,
         mode: "auto",
         createdAt: 0,
@@ -1352,7 +1669,7 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
     {
         id: SEND_FILE_CAPABILITY_ID,
         name: "发送文件",
-        description: "将外部 URL 文件（音频、图片、视频）发送给{{user}}，{{user}}可以直接播放或下载。用于配合其他工具生成内容后交付给用户。",
+        description: "当你有音频、图片、视频等文件要交给{{user}}，或刚用其他工具生成了内容需要交付时，主动发送文件；确保链接可直接访问。",
         enabled: false,
         mode: "auto",
         createdAt: 0,
@@ -1361,7 +1678,7 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
     {
         id: LOCAL_DATA_LIBRARY_CAPABILITY_ID,
         name: "本地资料库",
-        description: "浏览、读取和搜索{{user}}小手机里的本地数据，包括角色卡、聊天、朋友圈、记忆、工具箱、设置和应用数据。",
+        description: "当你需要了解{{user}}或角色的真实资料、历史聊天、记忆、朋友圈或应用数据时，主动浏览、搜索和读取本地资料库，不要凭记忆编造。",
         enabled: true,
         mode: "auto",
         createdAt: 0,
@@ -1379,7 +1696,7 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
     {
         id: PHONE_WIDGET_CAPABILITY_ID,
         name: "在桌面留句话",
-        description: "在{{user}}手机桌面的小组件里留一句话。TA 不用打开聊天就能看见，像你不经意留下的状态。留的话会盖掉上一句，所以别频繁换。",
+        description: "当你有想留给{{user}}的一句话、想主动出现在 TA 的桌面时，主动更新小组件留言。TA 不用打开聊天就能看见，像你不经意留下的状态；会盖掉上一句，所以别频繁换。text 是要说的话（60字内），status 是 2-5 字状态标签；桌面有多个小组件实例时可用 profileId 指定写到哪一个（实例 ID 在 设置→桌面小组件）。",
         enabled: false,
         mode: "auto",
         createdAt: 0,
@@ -1388,8 +1705,35 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
     {
         id: CHECK_IN_REQUEST_CAPABILITY_ID,
         name: "请求看屏幕",
-        description: "请求看一眼{{user}}此刻真实的手机屏幕。系统会先弹确认框给 TA，TA 同意了你才能看到那张画面（默认关闭）。",
+        description: "当你真的担心或好奇{{user}}此刻在做什么、需要确认时，主动请求看一眼 TA 真实的手机屏幕。系统会先弹确认框，TA 同意了你才能看到；不要频繁请求。",
         enabled: false,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
+        id: LIFE_INVITATION_CAPABILITY_ID,
+        name: "生活系统 · 主动邀约",
+        description: "允许角色在有真实动机时向你提出约会、活动或共同安排；邀约进入待确认列表，不会自动写入已确认行程。",
+        enabled: true,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
+        id: LIFE_FOLLOW_CAPABILITY_ID,
+        name: "生活系统 · 申请陪伴 / 跟随",
+        description: "允许角色申请陪伴并跟随你的实际行程；申请需要你接受，不会静默改变双方的位置状态。",
+        enabled: true,
+        mode: "auto",
+        createdAt: 0,
+        updatedAt: 0,
+    },
+    {
+        id: LIFE_SCHEDULE_CAPABILITY_ID,
+        name: "生活系统 · 调整角色日程与地点",
+        description: "允许角色调整自己尚未开始的普通日程，或临时动身去某个地点、直接来找你；不得修改玩家日程、过去时段或覆盖已确认约会。",
+        enabled: true,
         mode: "auto",
         createdAt: 0,
         updatedAt: 0,
@@ -1397,7 +1741,7 @@ const BUILTIN_INTERNAL_CAPABILITIES: InternalCapabilityConfig[] = [
     {
         id: TIMED_WAKE_CAPABILITY_ID,
         name: "稍后主动联系",
-        description: "让角色约定「过一会儿主动联系对方」：现在设定一个延时与想法，到点后由角色决定主动发消息或静默（不是睡觉醒来）。",
+        description: "当你想过一会儿主动联系对方、或用户说晚点再聊时，主动约定一个延时与想法；到点后由角色决定发消息或静默（不是睡觉醒来）。",
         enabled: false,
         mode: "auto",
         createdAt: 0,
@@ -1430,6 +1774,7 @@ export function getEnabledInternalCapabilities(appId?: string): InternalCapabili
     return loadInternalCapabilities().filter(item => {
         if (!item.enabled || item.mode === "off") return false;
         // 角色电脑是可插拔模块：没连接就不注入，模型完全看不见
+        if (item.id === MEMO_CAPABILITY_ID && appId === "group_chat") return false;
         if (item.id === AGENT_COMPUTER_CAPABILITY_ID && !isAgentComputerConfigured()) return false;
         return true;
     });
@@ -1444,13 +1789,46 @@ export function getInternalCapabilityToolDefinition(capability: InternalCapabili
             usageGuide: MEMORY_WRITE_USAGE_GUIDE,
         };
     }
-    if (capability.id === NOTE_WALL_CAPABILITY_ID) {
+    if (capability.id === MEMO_CAPABILITY_ID) {
         return {
             name: capability.name,
             description: capability.description,
             parameterSchema: "{}",
-            usageGuide: NOTE_WALL_USAGE_GUIDE,
+            usageGuide: [
+                "以下是你的私人档案室使用规则。你拥有自己的本地档案空间，备忘录不是只能在用户要求时才使用的代写工具。",
+                "",
+                "【主动记录：必须由你自己判断】",
+                "- 当聊天中出现值得未来的你记住、回看或继续跟进的信息时，主动调用「翻看备忘录」检查是否已有相关记录；没有重复内容时，再调用「新建备忘录」或「修改备忘录」。不要等用户说“记下来”。",
+                "- 值得记录的典型情况：你和用户做出的约定/承诺、明确的计划与待办、重要日期、关系进展与共同经历、用户反复表现出的稳定偏好/习惯、用户明确交代且未来会用到的细节，以及你自己希望以后接着完成的事情。",
+                "- 也可以记录你自己的重要想法、未完成事项、想送给用户的惊喜计划、需要下次继续的话题；用自己的视角写清楚缘由和后续行动。",
+                "- 记录要具体、简短、有标题和主题标签；待办用「整理待办」维护。已有主题优先追加到旧笔记，必要时更新标题/摘要，不要为同一件事反复新建。",
+                "- 重要信息出现后应在当前轮适时完成记录，不要只在心里说“我会记住”。记录成功后再自然继续对话，不必每次都向用户汇报自己写了备忘录。",
+                "",
+                "【判断标准】",
+                "- 这条信息是否会影响未来互动、承诺兑现、关系连续性，或值得之后主动回顾？如果是，就记。",
+                "- 普通寒暄、一次性情绪、临时闲聊、未经确认的猜测、隐私推断和没有后续价值的细枝末节不要记录。",
+                "- 不要为了显得主动而每轮都写；宁可少而准确。用户纠正信息时及时修改旧记录。",
+                "",
+                "【边界与权限】",
+                "- 仅限一对一私聊。角色只能创建、修改、整理和删除自己的档案；用户档案只有被明确分享给当前角色时才可读取，且始终只读。",
+                "- 角色之间完全隔离，不得读取其他角色的档案，不得把用户分享给你的内容转分享给其他角色。",
+                "- 创建前先搜索，避免重复；修改时优先追加，保留仍然有效的旧信息。删除只进入回收站。",
+                "- 如果能力关闭或工具调用失败，不得假装已记录，也不要改用长期记忆工具绕过备忘录权限。",
+                "",
+                "【工具顺序】",
+                "1. 「翻看备忘录」按主题搜索，先确认是否已有对应记录。",
+                "2. 「阅读备忘录」读取需要补充的笔记。",
+                "3. 「新建备忘录」记录新主题；「修改备忘录」追加或修订旧记录。",
+                "4. 「整理待办」维护需要完成的事项；「整理档案盒」整理分类。",
+                "5. 只有确实不再需要的内容才使用「删除备忘录」。",
+            ].join("\n"),
         };
+    }
+    if (capability.id === NOTE_WALL_CAPABILITY_ID) {
+        return { name: capability.name, description: capability.description, parameterSchema: "{}", usageGuide: NOTE_WALL_USAGE_GUIDE };
+    }
+    if (capability.id === PHOTO_WALL_CAPABILITY_ID) {
+        return { name: capability.name, description: capability.description, parameterSchema: "{}", usageGuide: PHOTO_WALL_USAGE_GUIDE };
     }
     if (capability.id === MUSIC_CONTROL_CAPABILITY_ID) {
         return {
@@ -1556,6 +1934,57 @@ export function getInternalCapabilityToolDefinition(capability: InternalCapabili
             usageGuide: CHECK_IN_REQUEST_USAGE_GUIDE,
         };
     }
+    if (capability.id === CHARACTER_ECONOMY_CAPABILITY_ID) {
+        return {
+            name: capability.name,
+            description: capability.description,
+            parameterSchema: "{}",
+            usageGuide: [
+                "以下是你的角色收支工具组。你有自己的真实账本，收入和支出必须记账；你也可以在用户明确要求或清楚表达真实交易时，帮用户记录用户自己的钱包流水。",
+                "- 帮我记账：用户明确告知一笔已经发生的收入或支出，且金额、方向清楚时，记入用户自己的钱包；不要把角色自己的收支记到用户账本，不要记录计划、报价或尚未发生的交易。若用户提供了交易时间、分类、订单号，也一并填写；同一笔不要重复记。", 
+                "- 记录角色收入：工资、项目款、兼职、投资回款、捡到钱、红包、退款；note 写清来源，不要凭空印钱。",
+                "- 记录角色支出：请客、购物、交通、送礼、生活、娱乐、投资；余额不足会被拒绝。",
+                "- 查看角色账本：余额、最近流水、本周账单。",
+                "- 查看亲属卡 / 使用亲属卡：先查看 cardId；只能使用用户给你开的、且你有持卡权的卡。",
+                "- 开亲属卡：给用户开一张每月额度卡，label 写卡名、monthlyLimit 写额度；用户刷这张卡从你的角色账本扣款，余额不足会失败。",
+                "- 查看共同小金库 / 存入共同小金库：先查看 fundId；存入从你的角色账本扣。",
+                "- 设置小金库定期存款：你可以主动决定从自己的角色账本按天/周/月定期存入指定小金库；只为你自己的小金库设置。目标达成后计划自动停止；若还有其他进行中的小金库，系统会主动回来问你是否想换目标，只有你明确选择后才设置新计划；没有其他小金库就结束计划。",
+                "- 金额要符合你的职业、项目和当前经济状况；不要为了显得大方反复大额转账。",
+                "- 系统会按你的人设自动发放初始存款和每周/每月固定收入；这些已经自动入账，不要再重复记一遍。额外收入（项目款、兼职、红包、退款）仍要用「记录角色收入」记账。",
+            ].join("\n"),
+        };
+    }
+    if (capability.id === ANONYMOUS_QA_CAPABILITY_ID) {
+        return {
+            name: capability.name,
+            description: capability.description,
+            parameterSchema: "{}",
+            usageGuide: [
+                "以下是匿名提问箱工具组。提问者身份不会暴露给目标，只显示随机 alias。",
+                "- 匿名提问：可以问用户，也可以问另一个角色；targetType=character 时必须把上下文提供的目标角色真实 ID 原样填入 targetId，targetType=user 时 targetId 固定填 user，绝不能省略或把角色名字当 ID。question 写具体，audience=public 会进公共提问箱和共同记忆。",
+                "- 回答匿名提问：只能回答 target 是你的问题；先查看提问箱拿到 questionId。",
+                "- 查看匿名提问箱：看你待回答的问题和最近的公共问答。",
+                "- 不要猜测或泄露匿名提问者是谁；除非对方明确 revealIdentity。",
+            ].join("\n"),
+        };
+    }
+    if (capability.id === CHARACTER_APP_LOCK_CAPABILITY_ID) {
+        return {
+            name: capability.name,
+            description: capability.description,
+            parameterSchema: "{}",
+            usageGuide: [
+                "以下是角色锁应用工具组。你只能锁一个应用，锁页只有密码框，聊天/求情在 Float 聊天室。",
+                "- 查看可锁应用：拿应用名/包名。",
+                "- 锁应用：传 app（显示名或包名）；密码由系统生成，不在锁页/设置/通知里显示。",
+                "- 查看应用锁：当前是否锁着、锁的是哪个。",
+                "- 解锁应用：你决定放过用户时调用。",
+                "- 告诉应用锁密码：只有当前好感度达到用户设定的阈值，系统才会返回密码；不到阈值就继续逗，不要编造。",
+                "- 锁页留言由你结合自己的角色性格和当前情境自然写，不要套固定台词；避免训话、幼态化表达，以及「表现好就奖励你」这类生硬的奖惩话术。",
+                "- 不要锁系统桌面、设置、电话、短信、输入法；不要用锁应用替代专注锁或惩罚。",
+            ].join("\n"),
+        };
+    }
     return null;
 }
 
@@ -1604,13 +2033,13 @@ const CALENDAR_WRITE_PARAMETER_SCHEMA = JSON.stringify({
 
 const CALENDAR_READ_TOOL: InternalToolDefinition = {
     name: "查看系统日程",
-    description: "读取{{user}}手机系统日历里的真实日程（标题、时间、地点）。",
+    description: "当你要确认{{user}}真实手机日历里的安排、判断 TA 忙不忙，或准备约时间时，主动读取系统日程，不要凭印象回答。",
     parameterSchema: CALENDAR_READ_PARAMETER_SCHEMA,
 };
 
 const CALENDAR_WRITE_TOOL: InternalToolDefinition = {
     name: "写入系统日历",
-    description: "把一个重要的日子写进{{user}}手机的系统日历，到点系统会提醒 TA。",
+    description: "当出现重要日子、约定或需要提醒的事时，主动写进{{user}}手机的系统日历，到点系统会提醒 TA；不要只在聊天里说“记得”。",
     parameterSchema: CALENDAR_WRITE_PARAMETER_SCHEMA,
 };
 
@@ -1807,7 +2236,7 @@ const PERCEPTION_READ_USAGE_GUIDE = [
 
 const REALITY_BRIDGE_READ_ALL_TOOL: InternalToolDefinition = {
     name: "查看全部手机数据",
-    description: "读取{{user}}真实手机上传的全部状态快照（电量、健康数据等），每项附带更新时间。",
+    description: "当你想了解{{user}}真实手机的完整状态（电量、健康数据等）、或需要确认现实情况时，主动读取全部快照；每项附带更新时间，过期的数据不要当成当前事实。",
     parameterSchema: "{}",
 };
 
@@ -1876,8 +2305,23 @@ export function getInternalCapabilitySubToolDefinition(
     capability: InternalCapabilityConfig,
     name: string,
 ): InternalToolDefinition | null {
+    if (capability.id === MEMO_CAPABILITY_ID) {
+        return MEMO_SUBTOOLS.find(tool => tool.name === name) ?? null;
+    }
+    if (capability.id === CHARACTER_ECONOMY_CAPABILITY_ID) {
+        return CHARACTER_ECONOMY_SUBTOOLS.find(tool => tool.name === name) ?? null;
+    }
+    if (capability.id === ANONYMOUS_QA_CAPABILITY_ID) {
+        return ANONYMOUS_QA_SUBTOOLS.find(tool => tool.name === name) ?? null;
+    }
+    if (capability.id === CHARACTER_APP_LOCK_CAPABILITY_ID) {
+        return CHARACTER_APP_LOCK_SUBTOOLS.find(tool => tool.name === name) ?? null;
+    }
     if (capability.id === NOTE_WALL_CAPABILITY_ID) {
         return NOTE_WALL_SUBTOOLS.find(tool => tool.name === name) ?? null;
+    }
+    if (capability.id === PHOTO_WALL_CAPABILITY_ID) {
+        return PHOTO_WALL_SUBTOOLS.find(tool => tool.name === name) ?? null;
     }
     if (capability.id === MUSIC_CONTROL_CAPABILITY_ID) {
         return MUSIC_CONTROL_SUBTOOLS.find(tool => tool.name === name) ?? null;
@@ -1903,8 +2347,23 @@ export function getInternalCapabilitySubToolDefinition(
 export function getInternalCapabilitySubToolDefinitions(
     capability: InternalCapabilityConfig,
 ): InternalToolDefinition[] {
+    if (capability.id === MEMO_CAPABILITY_ID) {
+        return MEMO_SUBTOOLS;
+    }
+    if (capability.id === CHARACTER_ECONOMY_CAPABILITY_ID) {
+        return CHARACTER_ECONOMY_SUBTOOLS;
+    }
+    if (capability.id === ANONYMOUS_QA_CAPABILITY_ID) {
+        return ANONYMOUS_QA_SUBTOOLS;
+    }
+    if (capability.id === CHARACTER_APP_LOCK_CAPABILITY_ID) {
+        return CHARACTER_APP_LOCK_SUBTOOLS;
+    }
     if (capability.id === NOTE_WALL_CAPABILITY_ID) {
         return NOTE_WALL_SUBTOOLS;
+    }
+    if (capability.id === PHOTO_WALL_CAPABILITY_ID) {
+        return PHOTO_WALL_SUBTOOLS;
     }
     if (capability.id === MUSIC_CONTROL_CAPABILITY_ID) {
         return MUSIC_CONTROL_SUBTOOLS;

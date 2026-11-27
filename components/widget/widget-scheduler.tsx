@@ -83,9 +83,15 @@ export function WidgetScheduler() {
       try {
         await hydrateKvDb();
         const config = loadWidgetConfig();
-        if (config.enabled && config.autoEnabled) {
-          const changed = await runWidgetAutoGenerate();
-          if (changed) pushWidgetToNative();
+        if (config.enabled) {
+          let contentChanged = false;
+          if (config.autoEnabled) {
+            contentChanged = await runWidgetAutoGenerate();
+            if (contentChanged) pushWidgetToNative();
+          }
+          // Keep virtual time/current activity fresh even when the character's message is unchanged.
+          // runWidgetAutoGenerate emits the normal update event when content changes.
+          if (!contentChanged) pushWidgetToNative();
         }
       } catch (err) {
         console.warn("[Widget] 调度失败", err);
@@ -107,15 +113,36 @@ export function WidgetScheduler() {
       void tick();
     }, 3000);
 
+    // App resumes after WebView suspension: refresh the native widget immediately
+    // and re-check the auto-generation deadline instead of waiting for the old timer.
+    const onResume = () => {
+      if (document.visibilityState !== "visible") return;
+      cancelStart();
+      if (cancelTimer) cancelTimer();
+      pushWidgetToNative();
+      void tick();
+    };
+    window.addEventListener("focus", onResume);
+    window.addEventListener("pageshow", onResume);
+    document.addEventListener("visibilitychange", onResume);
+
     // 内容一变立刻推：角色刚用工具留了话，桌面应该马上变，不该等下一轮检查
     const onUpdated = () => { pushWidgetToNative(); };
+    const onLifeUpdated = () => { pushWidgetToNative(); };
     window.addEventListener(WIDGET_UPDATED_EVENT, onUpdated);
+    // The native widget shares the same virtual-life source as the Life app.
+    // A location, activity, clock or schedule change refreshes its rendered card immediately.
+    window.addEventListener("virtual-life-state-updated", onLifeUpdated);
 
     return () => {
       disposed = true;
       cancelStart();
       if (cancelTimer) cancelTimer();
+      window.removeEventListener("focus", onResume);
+      window.removeEventListener("pageshow", onResume);
+      document.removeEventListener("visibilitychange", onResume);
       window.removeEventListener(WIDGET_UPDATED_EVENT, onUpdated);
+      window.removeEventListener("virtual-life-state-updated", onLifeUpdated);
     };
   }, []);
 

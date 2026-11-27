@@ -14,7 +14,13 @@ export type ServerBridgeRule = {
     id: string;
     name: string;
     matchType: string;
+    /** Optional case-insensitive payload keyword filter; terms separated by | or comma. */
+    payloadFilter?: string;
     cooldownMinutes?: number;
+    /** Scheduled rules are triggered by the personal-cloud minute scanner. */
+    schedule?: { kind: "daily" | "weekly" | "interval"; time?: string; weekday?: number; minutes?: number };
+    timeZone?: string;
+    createdAt?: string;
     process: {
         mode: "raw" | "template" | "ai";
         template?: string;
@@ -26,7 +32,9 @@ export type ServerBridgeRule = {
         historyRole?: "user" | "assistant" | "system";
         requestReply: boolean;
         characterName: string;
+        avatar?: string;
     };
+    offlineReplies?: string[];
     notify?: boolean;
     /** 出站快捷动作快照（从本机快捷动作解析）：规则命中时服务端直接创建
      *  快捷命令并推送运行通知，不等回端补账 */

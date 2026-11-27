@@ -1,10 +1,12 @@
 package app.floatphone.shell
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -47,6 +49,12 @@ class PushService : Service() {
         private const val CH_MESSAGES = "shell_messages"
         private const val CH_CALLS = "shell_calls"
         private const val NOTIF_FG_ID = 1
+        private const val PREFS = "shell_push_cache"
+        private const val KEY_URL = "supabase_url"
+        private const val KEY_ANON = "anon_key"
+        private const val KEY_USER = "user_id"
+        private const val WATCHDOG_INTERVAL_MS = 15 * 60 * 1000L
+        const val WATCHDOG_ACTION = "app.floatphone.shell.PUSH_WATCHDOG"
         private var running = false
 
         /**
@@ -125,29 +133,51 @@ class PushService : Service() {
         }
 
         /**
-         * 让现存的长连接立刻重来一次（用户点了「重连」、或刚改完账号/网络时）。
-         *
-         * 只取消当前 socket、不清退避计数：外层 connectionLoop 会把「断开」
-         * 当成一次普通异常关闭，先睡几秒再取配置重连——比等 60 秒重试窗口快得多。
-         */
-        fun requestReconnect() {
-            reconnectNonce += 1
-            log("用户请求重连")
-            // 没有存活连接时会话可能正卡在 60 秒重试窗口里（sleep 中），
-            // 光 cancel 一个 null socket 什么也不会发生；打断退避睡等待，
-            // 让外层循环立即回到「取配置 → 连接」。
-            activeSocket?.cancel()
-            activeLoop?.interrupt()
+/**
+     * 让现存的长连接立刻重来一次（用户点了「重连」、或刚改完账号/网络时）。
+     *
+     * 只取消当前 socket，不清退避计数：外层 connectionLoop 会把「断开」
+     * 当成一次普通异常关闭，先睡几秒再取配置重连——比等 60 秒重试窗口快得多。
+     */
+    fun requestReconnect() {
+        reconnectNonce += 1
+        log("用户请求重连")
+        // 没有存活连接时会话可能正卡在 60 秒重试窗口里（sleep 中），
+        // 光 cancel 一个 null socket 什么也不会发生：打断退避睡眠等待，
+        // 让外层循环立即回到「取配置 → 连接」。
+        activeSocket?.cancel()
+        activeLoop?.interrupt()
+    }
+
+    /** 重连计数：仅用于日志与诊断面板展示（每次 requestReconnect 自增）。 */
+    @Volatile private var reconnectNonce = 0
+
+    /** 当前长连接引用，供 requestReconnect() 主动打断。 */
+    @Volatile private var activeSocket: WebSocket? = null
+
+    /** 连接循环线程引用，供 requestReconnect() 打断退避睡眠。 */
+    @Volatile private var activeLoop: Thread? = null
+
+    /**
+     * 看门狗：厂商清理后台后，START_STICKY 不一定会把服务拉回来。
+     * 每 15 分钟给自己发一次精确闹钟，收到后若服务已死就重新 startForegroundService，
+     * 然后继续排下一次。精确闹钟会触发系统的短时允许名单，后台启动前台服务才不会被拦。
+     */
+    fun scheduleWatchdog(context: Context) {
+        runCatching {
+            val alarm = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            val intent = Intent(context, PushWatchdogReceiver::class.java).setAction(WATCHDOG_ACTION)
+            val pending = PendingIntent.getBroadcast(
+                context, 0x5055, intent,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            val triggerAt = System.currentTimeMillis() + WATCHDOG_INTERVAL_MS
+            val exactAllowed = Build.VERSION.SDK_INT < Build.VERSION_CODES.S || alarm.canScheduleExactAlarms()
+            if (exactAllowed) alarm.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pending)
+            else alarm.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAt, pending)
         }
+    }
 
-        /** 重连计数：仅用于日志与诊断面板展示（每次 requestReconnect 自增）。 */
-        @Volatile private var reconnectNonce = 0
-
-        /** 当前长连接引用，供 requestReconnect() 主动打断。 */
-        @Volatile private var activeSocket: WebSocket? = null
-
-        /** 连接循环线程引用，供 requestReconnect() 打断退避睡眠。 */
-        @Volatile private var activeLoop: Thread? = null
     }
 
     private val client = OkHttpClient.Builder()
@@ -165,7 +195,7 @@ class PushService : Service() {
     private var stopped = false
     private var msgSeq = 2
     private var notifId = 100
-    private var shellSubRegisteredUserId: String? = null
+    private var shellSubRegistered = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -177,11 +207,13 @@ class PushService : Service() {
         log("服务启动 site=${MainActivity.SITE_URL} 通知=${if (notificationGranted) "可用" else "被关闭"}")
         if (!notificationGranted) log("⚠ 通知权限或「角色消息」渠道被系统关闭，广播到了也不会显示")
         startForeground(NOTIF_FG_ID, buildKeepAliveNotification("等待连接…"))
+scheduleWatchdog(this)
         val loop = thread(name = "shell-push-loop") { connectionLoop() }
         activeLoop = loop
         // 顺手开诊断端口（仅 127.0.0.1）：手机浏览器打开 http://127.0.0.1:8787/
         // 就能看到本服务的完整轨迹，不必依赖 adb / chrome://inspect。
         PushDebugServer.start(this)
+
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
@@ -204,7 +236,7 @@ class PushService : Service() {
                 updateKeepAlive("未登录或站点不可达，稍后重试（$reason）")
                 sleepSec(60); continue
             }
-            updateKeepAlive("正在连接推送服务…")
+            updateKeepAlive("已连接，等待角色消息")
             val closedNormally = runSocket(config)
             if (stopped) break
             updateKeepAlive("连接断开，重连中…")
@@ -250,33 +282,56 @@ class PushService : Service() {
             }
         }
 
-        log("取配置：cookie=${if (cookie.isEmpty()) "空" else "有"}")
-        val me = getJson("/api/auth/me", "auth/me") ?: return null
+log("取配置: cookie=${if (cookie.isEmpty()) "空" else "有"}")
+        val me = getJson("/api/auth/me", "auth/me") ?: return@runCatching cachedConfig()
         val userId = me.optJSONObject("account")?.optString("id").orEmpty()
         if (userId.isEmpty()) {
             lastConfigNote = "auth/me 未返回账号（站点未登录）"
             log("auth/me 返回 account=null")
-            return null
+            return@runCatching null
         }
         log("账号 id=$userId")
-        val online = getJson("/api/online/config", "online/config") ?: return null
+        val online = getJson("/api/online/config", "online/config") ?: return@runCatching cachedConfig()
         if (!online.optBoolean("configured")) {
             lastConfigNote = "站点未配置 Supabase（online/config configured=false）"
             log("online/config configured=false")
-            return null
+            return@runCatching null
         }
         val url = online.optString("supabaseUrl")
         val key = online.optString("anonKey")
         if (url.isEmpty() || key.isEmpty()) {
             lastConfigNote = "online/config 缺 supabaseUrl/anonKey"
             log("online/config 字段为空")
-            return null
+            return@runCatching null
         }
         log("supabase=${url.substringAfter("//").substringBefore("/")}")
         lastConfigNote = ""
+        val config = PushConfig(url.trimEnd('/'), key, userId)
+        cacheConfig(config)
+
         registerShellSubscription(cookie, userId)
-        PushConfig(url.trimEnd('/'), key, userId)
+        config
     }.getOrNull()
+
+    /** 站点短暂不可达时用上次成功的连接参数续命，避免长连接跟着站点一起断。 */
+    private fun cachedConfig(): PushConfig? = runCatching {
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        val url = prefs.getString(KEY_URL, "").orEmpty()
+        val key = prefs.getString(KEY_ANON, "").orEmpty()
+        val userId = prefs.getString(KEY_USER, "").orEmpty()
+        if (url.isEmpty() || key.isEmpty() || userId.isEmpty()) null
+        else PushConfig(url, key, userId)
+    }.getOrNull()
+
+    private fun cacheConfig(config: PushConfig) {
+        runCatching {
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putString(KEY_URL, config.supabaseUrl)
+                .putString(KEY_ANON, config.anonKey)
+                .putString(KEY_USER, config.userId)
+                .apply()
+        }
+    }
 
     /**
      * 在站点注册一条合成推送订阅（endpoint = shell:<userId>）。
@@ -284,7 +339,7 @@ class PushService : Service() {
      * 要往 shellpush 频道广播；服务端不会对它做 Web Push 投递。
      */
     private fun registerShellSubscription(cookie: String, userId: String) {
-        if (shellSubRegisteredUserId == userId) return
+        if (shellSubRegistered) return
         runCatching {
             val body = JSONObject()
                 .put("endpoint", "shell:$userId")
@@ -300,15 +355,17 @@ class PushService : Service() {
             if (cookie.isNotEmpty()) builder.header("Cookie", cookie)
             val request = builder.build()
             client.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    shellSubRegisteredUserId = userId
-                    lastShellSubNote = "已注册 shell:$userId"
-                    log("订阅注册成功 shell:$userId")
-                } else {
-                    val text = response.body?.string().orEmpty()
-                    lastShellSubNote = "注册失败 HTTP ${response.code} ${text.take(80)}"
-                    log("订阅注册失败 HTTP ${response.code} ${text.take(120)}")
-                }
+if (response.isSuccessful) {
+            shellSubRegistered = true
+            shellSubRegisteredUserId = userId
+            lastShellSubNote = "已注册 shell:${userId}"
+            log("订阅注册成功 shell:${userId}")
+        } else {
+            val text = response.body?.string().orEmpty()
+            lastShellSubNote = "注册失败 HTTP ${response.code} ${text.take(80)}"
+            log("订阅注册失败 HTTP ${response.code}: ${text.take(120)}")
+        }
+
             }
         }.onFailure {
             lastShellSubNote = "注册异常 ${it.javaClass.simpleName}"
@@ -366,6 +423,7 @@ class PushService : Service() {
             override fun onMessage(webSocket: WebSocket, text: String) {
                 runCatching {
                     val msg = JSONObject(text)
+
                     // Supabase Realtime 的 phx_join 成功回执才代表频道真正订阅成功；
                     // WebSocket onOpen 仅表示 TCP/WebSocket 建立，不能提前报「已连接」。
                     if (msg.optString("event") == "phx_reply" && msg.optString("ref") == "1") {
@@ -409,8 +467,10 @@ class PushService : Service() {
                         log("广播 payload 为空")
                         return
                     }
+
                     val title = body.optString("title").ifEmpty { "小手机" }
                     val text2 = body.optString("body").ifEmpty { "有新消息" }
+                    val bridgeEventId = body.optString("bridgeEventId").trim()
                     // 来电：全屏来电通知（任何一步失败回落普通通知，主路不受影响）
                     if (body.optString("kind") == "call") {
                         val shown = runCatching {
@@ -420,14 +480,28 @@ class PushService : Service() {
                                 body.optLong("callTs", System.currentTimeMillis()),
                             )
                         }.isSuccess
-                        if (shown) return
+                        if (shown) {
+                            if (bridgeEventId.isNotEmpty()) sendBridgeReceipt(bridgeEventId)
+                            return
+                        }
                     }
-                    val shown = runCatching {
-                        showMessageNotification(title, text2, body.optString("sessionId"), body.optString("avatar"))
-                    }.isSuccess
-                    // 通知没发出去时别只留一条冷冰冰的轨迹——这恰恰是最需要人看见的一步。
-                    if (shown) log("已发系统通知：$title / ${text2.take(40)}")
-                    else log("系统通知发送失败（权限/渠道被关？）")
+val notificationPosted = runCatching {
+            showMessageNotification(
+                title, text2,
+                body.optString("sessionId"),
+                body.optString("avatar"),
+                body.optString("kind"),
+                body.optString("sceneId"),
+            )
+        }.getOrDefault(false)
+        // 通知没发出去时只剩一条冷冰冰的轨迹——这恰恰是最需要人看见的一步。
+        if (notificationPosted) {
+            log("已发系统通知: title=$title / $text2")
+            if (bridgeEventId.isNotEmpty()) sendBridgeReceipt(bridgeEventId)
+        } else {
+            log("系统通知发送失败（权限/渠道被关？）")
+        }
+
                 }
             }
 
@@ -459,6 +533,28 @@ class PushService : Service() {
         return normal
     }
 
+    /** 告知现实桥：这条事件通知已由 Android NotificationManager 接受提交。 */
+    private fun sendBridgeReceipt(eventId: String) {
+        thread(name = "bridge-notification-receipt") {
+            runCatching {
+                val cookie = CookieManager.getInstance().getCookie(MainActivity.SITE_URL).orEmpty()
+                val body = JSONObject()
+                    .put("eventId", eventId)
+                    .put("status", "posted")
+                    .toString()
+                    .toRequestBody("application/json; charset=utf-8".toMediaType())
+                val builder = Request.Builder()
+                    .url("${MainActivity.SITE_URL.trimEnd('/')}/api/push/bridge-native-event/receipt")
+                    .post(body)
+                    .header("Accept", "application/json")
+                if (cookie.isNotEmpty()) builder.header("Cookie", cookie)
+                avatarClient.newCall(builder.build()).execute().use { response ->
+                    if (!response.isSuccessful) android.util.Log.w("FloatPush", "bridge receipt rejected: ${response.code}")
+                }
+            }.onFailure { android.util.Log.w("FloatPush", "bridge receipt failed", it) }
+        }
+    }
+
     // ── 通知 ──
     private fun createChannels() {
         val manager = getSystemService(NotificationManager::class.java)
@@ -486,18 +582,23 @@ class PushService : Service() {
      * 点通知的落点：带 sessionId 时经深链直达对应会话，否则回首页。
      * 深链与 MainActivity 共用 EXTRA_OPEN_URL 通道。
      */
-    private fun contentIntent(sessionId: String? = null): PendingIntent {
+    private fun contentIntent(sessionId: String? = null, lifeScene: Boolean = false, sceneId: String? = null): PendingIntent {
         val intent = Intent(this, MainActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         val id = sessionId?.trim().orEmpty()
-        if (id.isNotEmpty()) {
-            intent.putExtra(
-                MainActivity.EXTRA_OPEN_URL,
-                "${MainActivity.SITE_URL.trimEnd('/')}/#open-chat=${android.net.Uri.encode(id)}",
-            )
+        val targetUrl = if (lifeScene) {
+            // Life-scene push taps must return to the living-world screen, not the
+            // normal chat session used only to build the offline model snapshot.
+            "${MainActivity.SITE_URL.trimEnd('/')}/life"
+        } else if (id.isNotEmpty()) {
+            "${MainActivity.SITE_URL.trimEnd('/')}/#open-chat=${android.net.Uri.encode(id)}"
+        } else {
+            ""
         }
+        if (targetUrl.isNotEmpty()) intent.putExtra(MainActivity.EXTRA_OPEN_URL, targetUrl)
+        val requestCode = if (lifeScene) ("life:" + sceneId.orEmpty()).hashCode() else id.hashCode()
         return PendingIntent.getActivity(
-            this, 0, intent,
+            this, requestCode, intent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
     }
@@ -575,14 +676,18 @@ class PushService : Service() {
         getSystemService(NotificationManager::class.java).notify(CallAlert.NOTIF_MISSED_ID, notification)
     }
 
-    private fun showMessageNotification(title: String, body: String, sessionId: String? = null, avatarUrl: String? = null) {
+    private fun showMessageNotification(title: String, body: String, sessionId: String? = null, avatarUrl: String? = null, kind: String = "", sceneId: String = ""): Boolean {
+        if (!NotificationManagerCompat.from(this).areNotificationsEnabled()) return false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+            && getSystemService(NotificationManager::class.java).getNotificationChannel(CH_MESSAGES)?.importance == NotificationManager.IMPORTANCE_NONE
+        ) return false
         val builder = NotificationCompat.Builder(this, CH_MESSAGES)
             .setSmallIcon(R.drawable.ic_stat)
             .setContentTitle(title)
             .setContentText(body)
             .setStyle(NotificationCompat.BigTextStyle().bigText(body))
             .setAutoCancel(true)
-            .setContentIntent(contentIntent(sessionId))
+            .setContentIntent(contentIntent(sessionId, kind == "life_scene", sceneId))
             .setPriority(NotificationCompat.PRIORITY_HIGH)
         // 角色头像当通知大图标（服务端随广播带的 avatar：data URL 或直链）。
         // 取不到就退回默认图标——头像只是锦上添花，绝不能拖住或搞丢通知。
@@ -590,9 +695,14 @@ class PushService : Service() {
         // 带「回复」按钮：用户可以直接在通知横幅上回一句，不用点开 App。
         // 没有 sessionId 的通知（系统提醒类）挂了也没处送，所以只在有时才加。
         val sid = sessionId?.trim().orEmpty()
-        if (sid.isNotEmpty()) builder.addAction(buildReplyAction(sid))
+        if (kind == "life_scene" && sid.isNotEmpty() && sceneId.isNotEmpty()) {
+            builder.setContentTitle("生活现场 · 主动消息")
+            builder.addAction(buildLifeReplyAction(sid, sceneId, "action", "回复行动"))
+            builder.addAction(buildLifeReplyAction(sid, sceneId, "dialogue", "回复对话"))
+        } else if (sid.isNotEmpty()) builder.addAction(buildReplyAction(sid))
         getSystemService(NotificationManager::class.java).notify(notifId++, builder.build())
         if (notifId > 400) notifId = 100
+        return true
     }
 
     /**
@@ -601,6 +711,18 @@ class PushService : Service() {
      * PendingIntent 必须是 MUTABLE：用户输入要先被系统填进 RemoteInput，
      * 不可变的 PendingIntent 装不下这个结果，回复框会打不开。
      */
+    private fun buildLifeReplyAction(sessionId: String, sceneId: String, mode: String, label: String): NotificationCompat.Action {
+        val remoteInput = RemoteInput.Builder(NotificationReplyReceiver.KEY_REPLY_TEXT).setLabel(label).build()
+        val intent = Intent(this, NotificationReplyReceiver::class.java).apply {
+            action = NotificationReplyReceiver.ACTION_REPLY
+            putExtra(NotificationReplyReceiver.EXTRA_SESSION_ID, sessionId)
+            putExtra(NotificationReplyReceiver.EXTRA_SCENE_ID, sceneId)
+            putExtra(NotificationReplyReceiver.EXTRA_REPLY_MODE, mode)
+        }
+        val pending = PendingIntent.getBroadcast(this, (sessionId + sceneId + mode).hashCode(), intent, PendingIntent.FLAG_MUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        return NotificationCompat.Action.Builder(R.drawable.ic_stat, label, pending).addRemoteInput(remoteInput).setAllowGeneratedReplies(true).build()
+    }
+
     private fun buildReplyAction(sessionId: String): NotificationCompat.Action {
         val remoteInput = RemoteInput.Builder(NotificationReplyReceiver.KEY_REPLY_TEXT)
             .setLabel("回复")
@@ -669,5 +791,14 @@ class PushService : Service() {
         } catch (_: InterruptedException) {
             // 用户主动重连：提前醒来，交给外层循环重新取配置
         }
+    }
+}
+
+/** 推送服务看门狗：收到闹钟就把服务拉起并续排下一次。 */
+class PushWatchdogReceiver : BroadcastReceiver() {
+    override fun onReceive(context: Context, intent: Intent?) {
+        if (intent?.action != PushService.WATCHDOG_ACTION) return
+        runCatching { PushService.start(context) }
+        runCatching { PushService.scheduleWatchdog(context) }
     }
 }

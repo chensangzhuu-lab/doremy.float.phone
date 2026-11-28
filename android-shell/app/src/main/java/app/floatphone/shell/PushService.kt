@@ -195,6 +195,7 @@ class PushService : Service() {
     private var msgSeq = 2
     private var notifId = 100
     private var shellSubRegistered = false
+    private var shellSubRegisteredUserId: String? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 

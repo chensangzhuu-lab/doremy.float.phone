@@ -84,6 +84,8 @@ android {
 
 dependencies {
     implementation 'androidx.core:core-ktx:1.13.1'
+// WebViewFeature / WebViewCompat：检测 WebView 能力并降级，避免旧机型崩溃。
+    implementation 'androidx.webkit:webkit:1.12.1'
     implementation 'androidx.appcompat:appcompat:1.7.0'
     implementation 'androidx.activity:activity-ktx:1.9.0'
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'

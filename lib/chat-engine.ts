@@ -1,9 +1,13 @@
 // lib/chat-engine.ts
 
 import { createSseJsonParser } from "./sse-json";
+import { makeNativeToolName } from "./native-tool-name";
+import { extractDsmlToolCalls } from "./dsml-tool-calls";
 import { maybeAppendShortcutCapability, maybeAppendPerceptionStatus } from "./offline-shortcut-capability";
 import { maybeBuildStatusInjection } from "./perception/describe";
 import { loadCharacters } from "./character-storage";
+import { buildCharacterEconomyContext } from "./economy/character-income";
+import { buildLifePresenceContext } from "./life/life-memory-bridge";
 import { buildScreenEffectPromptHint } from "./chat-screen-effects";
 import { emitChatPluginEvent, runChatPluginTransform } from "./chat-plugin-hooks";
 import { buildChatPluginPromptFragments } from "./chat-plugin-storage";
@@ -24,8 +28,9 @@ import {
     createToolExecutionId,
     isSessionStreamingEnabled,
     resolveMeetingInviteCardConfig,
+    resolveSessionCharacterId,
 } from "./chat-storage";
-import { extractTextToolDirectiveText, stripTextToolDirectives } from "./text-tool-protocol";
+import { extractTextToolDirectiveText, stripMalformedTextToolDirectives, stripTextToolDirectives } from "./text-tool-protocol";
 import { applyWithProtectedAvatarDecisionMarkers, findUserAvatarChangeIntent } from "./chat-avatar-intent";
 import type { ApiConfig, PresetConfig, Prompt, PromptOrderEntry, RegexConfig } from "./settings-types";
 import type { CustomAppPromptProfile } from "./custom-app-types";
@@ -67,7 +72,7 @@ import { prepareShortTermContext } from "./short-term-assembler";
 import { parseActionTags, dispatchActions } from "./action-parser";
 import { findEnabledToolForSchema, getEnabledTools, type EnabledTool } from "./tool-storage";
 import { formatToolsForPrompt, formatToolSchema } from "./tool-prompt";
-import { parseToolCalls, parseToolFetches, executeToolCalls, formatToolResults } from "./tool-executor";
+import { parseToolCalls, parseToolFetches, executeToolCalls, formatToolResults, resolveToolCallDisplayName } from "./tool-executor";
 import type { ToolCall, ToolResult } from "./tool-executor";
 import { getCustomStickerNames, getCustomStickerExample } from "./custom-sticker-storage";
 import { formatCustomAppChatDirectivesForPrompt } from "./custom-app-chat-directives";
@@ -83,6 +88,7 @@ import { pushApiLog } from "./api-log-store";
 export { getApiLogs, clearApiLogs, type DebugInfo } from "./api-log-store";
 import { stripStateAndInnerForPrompt } from "./prompt-sanitizer";
 import { getInternalCapability, getInternalCapabilitySubToolDefinitions } from "./internal-capability-storage";
+import { buildMemoPromptDigest } from "./memo-archive-storage";
 import { isMediaStoreRef, loadMediaBlob } from "./media-cache-storage";
 import {
     DEFAULT_CHAT_BILINGUAL_PROMPT,
@@ -327,10 +333,28 @@ function stripVisionPromptImageData(msg: ChatMessage): ChatMessage {
 export function applyVisionImagePromptLimit(history: ChatMessage[], limitValue: unknown): ChatMessage[] {
     const limit = normalizeVisionImagePromptLimit(limitValue);
     let remaining = limit;
+    const groupedDecisions = new Map<string, boolean>();
 
     for (let index = history.length - 1; index >= 0; index -= 1) {
         const msg = history[index];
         if (!isVisionPromptImageMessage(msg) || !hasVisionPromptImageData(msg)) continue;
+        const groupId = msg.mediaData?.imageGroupId;
+        if (groupId) {
+            const keepGroup = groupedDecisions.get(groupId);
+            if (keepGroup === true) continue;
+            if (keepGroup === false) {
+                history[index] = stripVisionPromptImageData(msg);
+                continue;
+            }
+            const keep = remaining > 0;
+            groupedDecisions.set(groupId, keep);
+            if (keep) {
+                remaining -= 1;
+                continue;
+            }
+            history[index] = stripVisionPromptImageData(msg);
+            continue;
+        }
         if (remaining > 0) {
             remaining -= 1;
             continue;
@@ -339,6 +363,44 @@ export function applyVisionImagePromptLimit(history: ChatMessage[], limitValue: 
     }
 
     return history;
+}
+
+/**
+ * Expand a merged multi-image chat message into one prompt message per image.
+ *
+ * IMPORTANT: this must run BEFORE prepareShortTermContext(), because
+ * prepareShortTermContext() returns unifiedRecentItems whose historyIndex values
+ * point into the history array it was given. If we expand the array afterwards,
+ * every history item after a multi-image message shifts and the assembler reads
+ * the wrong message (often dropping the newest user/assistant turns).
+ */
+export function expandVisionImageHistoryForPrompt(history: ChatMessage[]): ChatMessage[] {
+    return history.flatMap(msg => {
+        const extraRefs = msg.mediaType === "image" && Array.isArray(msg.mediaData?.imageRefs)
+            ? msg.mediaData.imageRefs.filter((ref): ref is string => typeof ref === "string" && Boolean(ref))
+            : [];
+        // 新数据通过 imageRefsExcludePrimary 明确表示只存额外图；旧版数组常包含主图。
+        // 不能简单按 URL 去重：用户可能重复选择同一张图片，必须保留那一张。
+        const legacyFullRefs = msg.mediaData?.imageRefsExcludePrimary !== true
+            && Boolean(msg.mediaUrl)
+            && extraRefs[0] === msg.mediaUrl;
+        const normalizedExtraRefs = legacyFullRefs ? extraRefs.slice(1) : extraRefs;
+        const refs = msg.mediaUrl ? [msg.mediaUrl, ...normalizedExtraRefs] : extraRefs;
+        if (refs.length < 2) return [{ ...msg }];
+        return refs.map((ref, index) => ({
+            ...msg,
+            id: `${msg.id}__group_image_${index + 1}`,
+            mediaUrl: ref,
+            mediaData: {
+                ...msg.mediaData,
+                imageRefs: undefined,
+                imageGroupId: msg.id,
+                imageGroupIndex: index,
+                imageGroupCount: refs.length,
+                label: msg.mediaData?.label ? `${msg.mediaData.label}（第 ${index + 1} 张，共 ${refs.length} 张）` : `合并图片（第 ${index + 1} 张，共 ${refs.length} 张）`,
+            },
+        }));
+    });
 }
 
 // API 调用日志存储已抽到 ./api-log-store（聊天引擎与 simpleLLMCall 通用），
@@ -362,6 +424,8 @@ type ChatPromptBuildOptions = {
     excludeOfflineSessionId?: string;
     promptProfile?: CustomAppPromptProfile;
     extraWorldBookIds?: string[];
+    /** Replace bound world books for one isolated generation request. */
+    worldBookIdsOverride?: string[];
     worldBookActivationContext?: string;
     activateAllWorldBooks?: boolean;
     toolsAllowed?: boolean;
@@ -369,6 +433,11 @@ type ChatPromptBuildOptions = {
     /** 只随本次请求送出的系统提示：不落库、不进历史、下一轮读不到。
      *  定时查岗这类「一次性事件」用它告诉角色此刻该怎么回应。 */
     ephemeralSystemNote?: string;
+    /** 是否把当前角色的线上私聊作为 recent_chat 注入短期时间线。
+     *  默认按 offline 判断；生活场景/日程等显式传 false，避免线上话题串味。 */
+    includeDirectChatEntries?: boolean;
+    /** Prevent cross-app timeline and memory context from entering one-off source extraction. */
+    isolatedPromptContext?: boolean;
 };
 
 function matchesPromptProfileRef(prompt: { identifier: string; name?: string }, refs: Set<string>): boolean {
@@ -1524,37 +1593,14 @@ type NativeChatToolBuildOptions = {
     userName?: string;
 };
 
-function stableToolHash(value: string): string {
-    let hash = 0;
-    for (const char of value) {
-        hash = ((hash * 31) + char.charCodeAt(0)) >>> 0;
-    }
-    return hash.toString(36).slice(0, 6);
-}
-
-function makeNativeToolName(displayName: string, used: Set<string>): string {
-    const base = displayName
-        .trim()
-        .toLowerCase()
-        .replace(/[^a-z0-9_-]+/g, "_")
-        .replace(/^_+|_+$/g, "")
-        .slice(0, 40);
-    const prefix = base && /^[a-zA-Z_]/.test(base) ? base : "action";
-    let name = `${prefix}_${stableToolHash(displayName)}`.slice(0, 64);
-    let index = 2;
-    while (used.has(name)) {
-        name = `${prefix}_${stableToolHash(displayName)}_${index}`.slice(0, 64);
-        index += 1;
-    }
-    used.add(name);
-    return name;
-}
-
 export function nativeToolSourceKey(tool: EnabledTool): string {
     return `${tool.source}:${tool.sourceId}`;
 }
 
 export function isNativeSingleTool(tool: EnabledTool): boolean {
+    // Life tools already carry their own parameter schema; registering them as
+    // expandable packages creates an empty loader and hides the real actions.
+    if (tool.source === "life") return true;
     if (tool.source === "rest") return true;
     if (tool.source === "composite") return true;
     if (tool.source === "custom_app") return true;
@@ -1807,8 +1853,12 @@ export async function buildChatPromptMessages(
     // 避免拉黑/解除拉黑刚切换后仍使用进入聊天室时的旧 session 快照。
     session = loadChatSessions().find(item => item.id === session.id) ?? session;
     const chars = loadCharacters();
-    const character = chars.find(c => c.id === session.contactId);
-    if (!character) throw new ChatEngineError(`Character not found: ${session.contactId}`);
+    // Normal chats store ChatContact.id; virtual life sessions may store Character.id.
+    const resolvedCharacterId = resolveSessionCharacterId(session);
+    const character = resolvedCharacterId
+        ? chars.find(c => c.id === resolvedCharacterId)
+        : undefined;
+    if (!character) throw new ChatEngineError(`Character not found for session contact ${session.contactId}; resolved character ID: ${resolvedCharacterId || "unresolved"}`);
 
     const resolvedAppId = options?.appId ?? "chat";
     const bindings = loadBindingConfig();
@@ -1832,7 +1882,9 @@ export async function buildChatPromptMessages(
 
     const allWorldBooks = loadWorldBooks();
     const extraWorldBookIds = options?.extraWorldBookIds ?? [];
-    const worldBookIds = [...new Set([...(activeSlot.worldBookIds || []), ...extraWorldBookIds])];
+    const worldBookIds = options?.worldBookIdsOverride
+        ? [...new Set(options.worldBookIdsOverride)]
+        : [...new Set([...(activeSlot.worldBookIds || []), ...extraWorldBookIds])];
     const worldBooks = promptProfile?.enableWorldBooks === false
         ? []
         : worldBookIds.map(id => allWorldBooks.find(w => w.id === id)).filter(Boolean) as typeof allWorldBooks;
@@ -1862,19 +1914,53 @@ export async function buildChatPromptMessages(
         : history;
 
     const now = new Date();
-    const promptTimeContext = buildCharacterTimeContext(character.timeZone, now);
+    const promptTimeContext = buildCharacterTimeContext(character.timeZone, now, loadChatAppSettings().timeAware !== false);
     const promptTimestampOptions = getPromptTimestampOptionsForTimeContext(promptTimeContext);
     const memConfig = loadMemoryConfig();
     const isOfflineMode = options?.appTags?.includes("offline") === true;
-    const effectiveAppTags = mergeAppTags(options?.appTags, promptProfile?.appTags, resolvedAppId);
+    const memoCapability = getInternalCapability("memo_archive");
+    const memoPromptEnabled = resolvedAppId === "chat" && !session.isGroup && !isOfflineMode
+        && memConfig.shortTermAllowedSources?.memo !== false
+        && memoCapability?.enabled === true && memoCapability.mode !== "off";
+    const baseAppTags = mergeAppTags(options?.appTags, promptProfile?.appTags, resolvedAppId) ?? [];
+    const effectiveAppTags = memoPromptEnabled
+        ? [...new Set([...baseAppTags, "memo"])]
+        : baseAppTags.filter(tag => tag !== "memo");
+    if (memoPromptEnabled && preset) {
+        const memoPrompt = {
+            identifier: "memo_behavior",
+            name: "▸ 私人备忘录记录规则",
+            role: "system" as const,
+            content: [
+                "你拥有只属于当前角色的私人备忘录。它用于保存你认为未来值得回看的具体信息，而不是逐轮记录聊天。",
+                "当对话出现明确承诺、共同计划与待办、重要日期、关系进展、稳定习惯偏好、用户明确要求记住的事项，或你自己希望以后继续的话题时，你可以主动判断是否值得记录，不必等待用户提醒。",
+                "写入前先搜索现有备忘录；已有主题优先补充或更新，避免重复建档。用户分享给你的备忘录只读；你只能修改自己的记录。不要记录琐碎闲聊、短暂情绪、猜测或敏感推断。",
+                "记录操作不必逐次向用户播报；只有在确实相关时自然提及。工具不可用或写入失败时，不要声称已经记录。",
+            ].join("\\n"),
+            injection_position: 0,
+            injection_depth: 0,
+            enabled: true,
+            tags: ["chat", "memo"],
+        };
+        preset = {
+            ...preset,
+            prompts: [...(preset.prompts ?? []).filter(item => item.identifier !== "memo_behavior"), memoPrompt],
+            prompt_order: [...(preset.prompt_order ?? []).filter(item => item.identifier !== "memo_behavior"), { identifier: "memo_behavior", enabled: true }],
+        };
+    }
     const toolsAllowed = options?.toolsAllowed !== false && !isOfflineMode;
     const enabledTools = toolsAllowed ? getEnabledTools(resolvedAppId) : [];
+    const hasLifeTools = enabledTools.some(tool => tool.source === "life");
     const toolsEnabled = enabledTools.length > 0
-        && (options?.forceEnableTools === true || presetIncludesToolsMacro(preset, resolvedAppId, effectiveAppTags));
+        && (options?.forceEnableTools === true || hasLifeTools || memoPromptEnabled || presetIncludesToolsMacro(preset, resolvedAppId, effectiveAppTags));
     const usesNativeActions = Boolean(toolsEnabled && nativeToolProtocolForConfig(config));
+    // 多图必须在 prepareShortTermContext 之前展开：后者的 unifiedRecentItems 下标
+    // 指向传入的 history 数组；先展开才能保证下标和最终 promptHistory 一致。
+    const historyForPromptExpanded = expandVisionImageHistoryForPrompt(historyForPrompt);
     const { recentBlocks, truncatedHistory, wbActivationContext, unifiedRecentItems } = prepareShortTermContext(character.id, resolvedAppId, {
-        history: historyForPrompt,
-        includeDirectChatEntries: isOfflineMode,
+        history: historyForPromptExpanded,
+        includeDirectChatEntries: options?.includeDirectChatEntries ?? isOfflineMode,
+        includeTimeline: options?.isolatedPromptContext !== true,
         includeNativeToolHistory: usesNativeActions,
         excludeOfflineSessionId: options?.excludeOfflineSessionId,
         promptTimestampOptions,
@@ -1891,14 +1977,28 @@ export async function buildChatPromptMessages(
     }
 
     const [memResults, coreResults, musicLocal, musicCloud] = await Promise.all([
-        retrieveMemoriesForPrompt(character.id, wbActivationContext, memConfig).catch(() => null),
-        retrieveCoreMemoriesForPrompt(character.id, memConfig).catch(() => null),
+        options?.isolatedPromptContext === true ? Promise.resolve(null) : retrieveMemoriesForPrompt(character.id, wbActivationContext, memConfig).catch(() => null),
+        options?.isolatedPromptContext === true ? Promise.resolve(null) : retrieveCoreMemoriesForPrompt(character.id, memConfig).catch(() => null),
         buildMusicLocalMacro(),
         buildMusicCloudMacro(),
     ]);
 
-    const longTermMemories = memResults ? formatLongTermMemories(memResults) : "";
-    const coreMemories = coreResults ? formatCoreMemories(coreResults) : "";
+    const memoDigest = !session.isGroup && resolvedAppId === "chat" && memConfig.shortTermAllowedSources?.memo !== false && memoCapability?.enabled && memoCapability.mode !== "off"
+        && toolsEnabled ? await buildMemoPromptDigest(character.id).catch(() => "")
+        : "";
+
+    const longTermMemories = [
+        memResults ? formatLongTermMemories(memResults) : "",
+        memoDigest,
+        // 生活共同事实已经由短期时间线的 life 条目注入；旧 buildLifeMemoryContext
+        // 再把同一批事实拼进长期块，会让同一件事在提示词里出现两遍。
+        // 这里只保留“当前生活状态”，历史事实交给统一短期时间线。
+        ...(options?.isolatedPromptContext === true ? [] : [
+            buildLifePresenceContext(character.id),
+            buildCharacterEconomyContext(character.id),
+        ]),
+    ].filter(Boolean).join("\n\n");
+    const coreMemories = options?.isolatedPromptContext === true ? "" : (coreResults ? formatCoreMemories(coreResults) : "");
     const scheduleSummary = buildCalendarScheduleMarker("character", character.id, getWeekStartIso(now));
     const currentSchedule = getCurrentCalendarScheduleForPrompt("character", character.id, now);
     const musicOnlineHint = isNeteaseConfigured() ? "- 你可以推荐任何歌曲，系统会在线搜索并播放。不局限于用户本地音乐库。\n" : "\n";
@@ -1943,7 +2043,7 @@ export async function buildChatPromptMessages(
         currentSchedule,
         coreMemories,
         longTermMemories,
-        worldBookActivationContext: options?.worldBookActivationContext || wbActivationContext,
+        worldBookActivationContext: options?.worldBookActivationContext ?? wbActivationContext,
         activateAllWorldBooks: options?.activateAllWorldBooks,
         recentBlocks,
         unifiedRecentItems,
@@ -1967,6 +2067,17 @@ export async function buildChatPromptMessages(
         offlineSummaryTag: preset?.story_summary_tag?.trim() || "summary",
         nativeToolHistory: usesNativeActions,
     });
+    if (memoDigest) {
+        llmMessages.push({
+            role: "system",
+            content: [
+                "【私人备忘录维护】本轮包含到期手记。你不是只把它们读一遍：要结合近期对话和已有内容逐条核对，必要时使用「阅读备忘录」「修改备忘录」「新建备忘录」「整理待办」「删除备忘录」等工具实际维护。",
+                "优先修正旧内容、补充新进展、合并重复信息、清理明确过期的待办；不确定的信息保留并标注待确认，不要凭猜测覆盖事实。删除只移入回收站，用户分享的笔记只读。",
+                "最后必须调用「完成备忘录维护」登记本轮实际检查的 noteId、结论和真实变更。只有该工具成功返回，系统才会把对应笔记标记为已维护；普通聊天生成成功不代表维护完成。",
+            ].join("\n"),
+        });
+    }
+
     const avatarChangeIntent = !session.isGroup
         ? findUserAvatarChangeIntent(historyForPrompt, session.id, character.id)
         : null;
@@ -2100,14 +2211,23 @@ export type OfflineChatCompletionResult = ParsedOfflineResponse & {
 export async function generateOfflineChatCompletion(
     session: ChatSession,
     history: ChatMessage[],
-    options?: { signal?: AbortSignal; onStreamDelta?: (delta: string) => void },
+    options?: { signal?: AbortSignal; onStreamDelta?: (delta: string) => void; includeDirectChatEntries?: boolean; appId?: string; appTags?: string[]; worldBookIdsOverride?: string[]; worldBookActivationContext?: string; promptProfile?: CustomAppPromptProfile; isolatedPromptContext?: boolean; toolsAllowed?: boolean },
 ): Promise<OfflineChatCompletionResult> {
+    const appId = options?.appId ?? "chat";
+    const appTags = options?.appTags ?? ["chat", "offline"];
     const { llmMessages, character, config, preset, regexes, userIdentity } = await buildChatPromptMessages(
         session,
         history,
         {
-            appTags: ["chat", "offline"],
+            appId,
+            appTags,
             excludeOfflineSessionId: session.id,
+            includeDirectChatEntries: options?.includeDirectChatEntries,
+            worldBookIdsOverride: options?.worldBookIdsOverride,
+            worldBookActivationContext: options?.worldBookActivationContext,
+            promptProfile: options?.promptProfile,
+            isolatedPromptContext: options?.isolatedPromptContext,
+            toolsAllowed: options?.toolsAllowed,
         },
     );
     const summaryTag = preset?.story_summary_tag?.trim() || "summary";
@@ -2116,7 +2236,8 @@ export async function generateOfflineChatCompletion(
     let reasoning = "";
     const meta = { characterName: character.name, userName: userIdentity?.name };
     const requestOptions = {
-        appTags: ["chat", "offline"],
+        appId,
+        appTags,
         debugSessionId: session.id,
         signal: options?.signal,
         onReasoning: (t: string) => { reasoning = t; },
@@ -2126,8 +2247,8 @@ export async function generateOfflineChatCompletion(
         // 线下流式：正文边生成边通过 onStreamDelta 交给 UI 做实时预览；
         // 摘要补提仍走整段请求（输出短，无需流式）。
         const streamResult = await sendLLMStreamRequest(config, preset, llmMessages, regexes, meta, {
-            appId: "chat",
-            appTags: ["chat", "offline"],
+            appId,
+            appTags,
             debugSessionId: session.id,
             signal: options?.signal,
         }, {
@@ -2225,7 +2346,7 @@ async function generateNativeChatCompletion(
     const requestMessages: LlmRequestMessage[] = toLlmRequestMessages(llmMessages);
     const parts: ChatCompletionPart[] = [];
     const meta = { characterName: character.name, userName: userIdentity?.name };
-    const actionContext = { characterId: session.contactId, sessionId: session.id, sourceEngine: "chat" as const, signal: options?.signal };
+    const actionContext = { characterId: character.id, sessionId: session.id, sourceEngine: "chat" as const, signal: options?.signal };
     const expandableSourceKeys = new Set(enabledTools.filter(tool => !isNativeSingleTool(tool)).map(nativeToolSourceKey));
 
     const maxToolRounds = getMaxToolRounds();
@@ -2289,6 +2410,12 @@ async function generateNativeChatCompletion(
 
         // 线上思维链标签解析：开启时从正文提取 <tag> 思维链（覆盖原生），并剥离标签后再做后续解析
         let displayContent = result.content;
+        // DeepSeek 可能把工具调用写成 DSML 标记混在正文里：取出来并回填为原生调用。
+        const dsmlPass = extractDsmlToolCalls(displayContent);
+        if (dsmlPass.toolCalls.length > 0) {
+            displayContent = dsmlPass.text;
+            result = { ...result, toolCalls: [...result.toolCalls, ...dsmlPass.toolCalls] };
+        }
         if (onlineThinkingEnabled) {
             const tagThinking = extractThinkingTag(displayContent, onlineThinkingTag);
             if (tagThinking) callbacks?.onReasoning?.(tagThinking);
@@ -2334,7 +2461,7 @@ async function generateNativeChatCompletion(
         const textCalls = realNativeCalls.map((call) => nativeChatToolCallToTextCall(call, nativeBundle));
         const displayedActionNames = [
             ...loaderCalls.map(item => `展开「${item.loader.label}」动作说明`),
-            ...realNativeCalls.map(call => nativeBundle.displayNameMap.get(call.name) || nativeBundle.nameMap.get(call.name) || call.name),
+            ...realNativeCalls.map(call => nativeBundle.displayNameMap.get(call.name) || nativeBundle.nameMap.get(call.name) || resolveToolCallDisplayName(call.name, { appId: options?.appId ?? "chat", sessionId: session.id, characterId: character.id, sourceEngine: "chat" })),
         ];
         const actorName = character.name;
         callbacks?.onToolNotice?.(`${actorName}正在${displayedActionNames.join("、")}...`);
@@ -2348,7 +2475,7 @@ async function generateNativeChatCompletion(
                 realResults = await executeToolCalls(textCalls, {
                     appId: options?.appId ?? "chat",
                     sessionId: session.id,
-                    characterId: session.contactId,
+                    characterId: character.id,
                     sourceEngine: "chat",
                     signal: options?.signal,
                     onShortcutCommandCreated: onlyNativeCall ? async command => {
@@ -2592,7 +2719,8 @@ export async function generateChatCompletion(
         shortcutCancelled: false,
     };
     try {
-        return await generateChatCompletionCore(session, history, options, callbacks, bailoutRef);
+        const result = await generateChatCompletionCore(session, history, options, callbacks, bailoutRef);
+        return result;
     } catch (err) {
         if (options?.signal?.aborted) bailoutRef.shortcutCancelled = true;
         throw err;
@@ -2682,7 +2810,7 @@ async function generateChatCompletionCore(
     // ── Tool calling loop with real-time callbacks ──
     const parts: ChatCompletionPart[] = [];
     const meta = { characterName: character.name, userName: userIdentity?.name };
-    const actionContext = { characterId: session.contactId, sessionId: session.id, sourceEngine: "chat" as const, signal: options?.signal };
+    const actionContext = { characterId: character.id, sessionId: session.id, sourceEngine: "chat" as const, signal: options?.signal };
 
     const maxToolRounds = getMaxToolRounds();
     const onlineThinking = {
@@ -2745,8 +2873,11 @@ async function generateChatCompletionCore(
         // 剔除预设配置的文本片段（<思考结束> 等残留标签），不进入消息/提示词
         filteredOutput = stripPresetTexts(filteredOutput, preset);
 
+        // 文本协议路径同样可能收到 DSML 标记：先剥掉，能解析出的调用并入本轮工具调用。
+        const dsmlPass = extractDsmlToolCalls(filteredOutput);
+        const textOutput = dsmlPass.text;
         // Parse actions (朋友圈 etc) — strip from display text but keep tool tags
-        const { cleanText: afterActionStrip, actions } = parseActionTags(filteredOutput);
+        const { cleanText: afterActionStrip, actions } = parseActionTags(textOutput);
         if (actions.length > 0) {
             throwIfAborted(options?.signal);
             dispatchActions(actions, actionContext).catch(err => console.warn("[ChatEngine] Action dispatch failed:", err));
@@ -2754,14 +2885,21 @@ async function generateChatCompletionCore(
 
         // Check for [获取指令:xxx] and [执行动作:xxx({...})]
         const toolFetches = toolsEnabled ? parseToolFetches(afterActionStrip) : [];
-        const { toolCalls } = toolsEnabled ? parseToolCalls(afterActionStrip) : { toolCalls: [] };
-        const assistantForToolContext = stripStateAndInnerForPrompt(filteredOutput);
+        const parsedTextCalls: ToolCall[] = toolsEnabled ? parseToolCalls(afterActionStrip).toolCalls : [];
+        const dsmlTextCalls: ToolCall[] = toolsEnabled
+            ? dsmlPass.toolCalls.map(call => ({ name: call.name, args: call.args }))
+            : [];
+        const toolCalls: ToolCall[] = [...parsedTextCalls, ...dsmlTextCalls];
+        // Tool directives are protocol, never user-facing prose. Strip valid directives
+        // (they are persisted separately below) and discard malformed directive lines.
+        const visibleText = stripMalformedTextToolDirectives(stripTextToolDirectives(afterActionStrip));
+        const assistantForToolContext = stripStateAndInnerForPrompt(textOutput);
 
         // No tool activity — final round
         if (toolFetches.length === 0 && toolCalls.length === 0) {
             throwIfAborted(options?.signal);
-            await callbacks?.onTextPart?.(afterActionStrip);
-            parts.push({ text: afterActionStrip });
+            await callbacks?.onTextPart?.(visibleText);
+            parts.push({ text: visibleText });
             if (bailoutRef.shortcutHandles.length > 0) bailoutRef.shortcutCompleted = true;
             break;
         }
@@ -2771,14 +2909,14 @@ async function generateChatCompletionCore(
         throwIfAborted(options?.signal);
         const responseBatchId = createResponseBatchId();
         const toolDirectiveText = extractTextToolDirectiveText(afterActionStrip);
-        await callbacks?.onTextPart?.(afterActionStrip, undefined, {
+        await callbacks?.onTextPart?.(visibleText, undefined, {
             responseBatchId,
             rawResponseText: afterActionStrip,
         });
         if (toolDirectiveText) {
             callbacks?.onToolAssistantTurn?.(toolDirectiveText, { responseBatchId });
         }
-        parts.push({ text: filteredOutput });
+        parts.push({ text: visibleText });
 
         // Helper: find insert index for injecting after history
         const findInsertIdx = () => {
@@ -2822,7 +2960,10 @@ async function generateChatCompletionCore(
         // Handle [执行动作:xxx({...})] — execute calls
         if (toolCalls.length > 0) {
             const actorName = toolCalls[0]?.actor || character.name;
-            const toolNotice = `${actorName}正在${toolCalls.map(t => t.name).join("、")}...`;
+            // 模型有时把原生工具名（action_xxxx）写进文本协议；执行前会解析回中文名，
+            // 状态文案也必须用同一套解析，否则聊天里只会显示一串哈希。
+            const displayNameContext = { appId: options?.appId ?? "chat", sessionId: session.id, characterId: character.id, sourceEngine: "chat" as const };
+            const toolNotice = `${actorName}正在${toolCalls.map(t => resolveToolCallDisplayName(t.name, displayNameContext)).join("、")}...`;
             callbacks?.onToolNotice?.(toolNotice);
 
             let results: Awaited<ReturnType<typeof executeToolCalls>>;
@@ -2831,7 +2972,7 @@ async function generateChatCompletionCore(
                 results = await executeToolCalls(toolCalls, {
                     appId: options?.appId ?? "chat",
                     sessionId: session.id,
-                    characterId: session.contactId,
+                    characterId: character.id,
                     sourceEngine: "chat",
                     signal: options?.signal,
                     onShortcutCommandCreated: onlyToolCall ? async command => {

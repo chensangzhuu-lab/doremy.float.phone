@@ -24,8 +24,11 @@ import {
 import { momentsDb } from "./moments-db";
 import { hydrateMomentsStorage, updateMomentPost } from "./moments-storage";
 import { deleteTrack, getAudioBlob, loadAllTracks } from "./music-storage";
+import { loadPhotoWallState, savePhotoWallState } from "./photo-wall-storage";
 import { deleteRawFile, hydrateReadingStorage, listRawFileSummaries, loadBooks } from "./reading-storage";
 import { loadXiaohongshuState, saveXiaohongshuState } from "./xiaohongshu-storage";
+import { loadAllCustomApps } from "./builtin-apps/registry";
+import { kvGet, kvKeysWithPrefix, kvRemove } from "./kv-db";
 
 /**
  * 「存储空间」引擎：把本机占用按用户能看懂的内容类别统计出来，并支持
@@ -43,12 +46,14 @@ export type StorageCategoryId =
   | "chat_images"
   | "chat_voice"
   | "chat_media_files"
+  | "photo_wall_images"
   | "moments_images"
   | "xiaohongshu_images"
   | "local_music"
   | "dwelling_images"
   | "theme_assets"
   | "reading_raw_files"
+  | "orphan_app_data"
   | "orphan_media";
 
 export type StorageCategoryStat = {
@@ -71,6 +76,11 @@ const MEDIA_CACHE_DB = "AiPhoneMediaCacheDB";
 const ORPHAN_GRACE_MS = 24 * 60 * 60 * 1000;
 
 const CATEGORY_META: Record<StorageCategoryId, { label: string; description: string; supportsKeepDays: boolean }> = {
+  photo_wall_images: {
+    label: "照片墙图片",
+    description: "你收藏的照片和角色生成的生活照片。清理会从照片墙移除记录；媒体文件会在确认无其他引用后由孤儿媒体清理回收。",
+    supportsKeepDays: true,
+  },
   chat_images: {
     label: "聊天图片",
     description: "聊天里收发和 AI 生成的图片。清理后聊天文字保留，图片显示为已清理。",
@@ -114,6 +124,11 @@ const CATEGORY_META: Record<StorageCategoryId, { label: string; description: str
   reading_raw_files: {
     label: "阅读原始文件",
     description: "TXT/EPUB 导入后的原始文件（章节已单独入库，删除不影响阅读）。PDF 需要原文才能阅读，会自动保留。",
+    supportsKeepDays: false,
+  },
+  orphan_app_data: {
+    label: "未安装 APP 残留",
+    description: "已卸载或重置后仍留在本地的自定义 APP 私有数据、时间线和宿主通知残留。清理不影响已安装的 APP。",
     supportsKeepDays: false,
   },
   orphan_media: {
@@ -190,8 +205,41 @@ async function collectOrphanMedia(): Promise<Array<{ id: string; bytes: number }
   }, [MEDIA_CACHE_DB]);
   const now = Date.now();
   return summaries
-    .filter((item) => !referenced.has(item.id) && now - item.createdAt >= ORPHAN_GRACE_MS)
+    .filter((item) => item.retainedBy.length === 0 && !referenced.has(item.id) && now - item.createdAt >= ORPHAN_GRACE_MS)
     .map((item) => ({ id: item.id, bytes: item.bytes }));
+}
+
+// ── 未安装 APP 的残留数据 ──
+const CUSTOM_APP_DATA_PREFIX = "ai_phone_custom_app_data_v1:";
+const CUSTOM_APP_TIMELINE_PREFIX = "ai_phone_custom_app_timeline_v1:";
+
+function customAppIdFromKey(key: string): string | null {
+  if (key.startsWith(CUSTOM_APP_DATA_PREFIX)) {
+    const rest = key.slice(CUSTOM_APP_DATA_PREFIX.length);
+    const slash = rest.indexOf("/");
+    return (slash >= 0 ? rest.slice(0, slash) : rest) || null;
+  }
+  if (key.startsWith(CUSTOM_APP_TIMELINE_PREFIX)) {
+    return key.slice(CUSTOM_APP_TIMELINE_PREFIX.length) || null;
+  }
+  return null;
+}
+
+function collectOrphanCustomAppData(): { keys: string[]; bytes: number } {
+  const installed = new Set(loadAllCustomApps().map(app => app.id));
+  const keys = [
+    ...kvKeysWithPrefix(CUSTOM_APP_DATA_PREFIX),
+    ...kvKeysWithPrefix(CUSTOM_APP_TIMELINE_PREFIX),
+  ];
+  const orphanKeys: string[] = [];
+  let bytes = 0;
+  for (const key of keys) {
+    const appId = customAppIdFromKey(key);
+    if (!appId || installed.has(appId)) continue;
+    orphanKeys.push(key);
+    bytes += (kvGet(key) || "").length;
+  }
+  return { keys: orphanKeys, bytes };
 }
 
 // ── 扫描 ──
@@ -225,6 +273,18 @@ export async function scanStorageSpace(onProgress?: (detail: string) => void): P
   stats.push(makeStat("chat_images", chatTotals.image.bytes, chatTotals.image.count));
   stats.push(makeStat("chat_voice", chatTotals.voice.bytes, chatTotals.voice.count));
   stats.push(makeStat("chat_media_files", chatTotals.file.bytes, chatTotals.file.count));
+
+  onProgress?.("统计照片墙图片…");
+  const photoWall = loadPhotoWallState();
+  let photoWallBytes = 0;
+  let photoWallCount = 0;
+  for (const photo of photoWall.photos) {
+    const bytes = mediaRefBytes(photo.mediaRef, new Set(), mediaBytesById);
+    if (bytes <= 0) continue;
+    photoWallBytes += bytes;
+    photoWallCount += 1;
+  }
+  stats.push(makeStat("photo_wall_images", photoWallBytes, photoWallCount));
 
   onProgress?.("统计朋友圈图片…");
   await hydrateMomentsStorage().catch(() => undefined);
@@ -290,6 +350,10 @@ export async function scanStorageSpace(onProgress?: (detail: string) => void): P
     deletableRawFiles.reduce((sum, item) => sum + item.bytes, 0),
     deletableRawFiles.length,
   ));
+
+  onProgress?.("扫描未安装 APP 残留…");
+  const orphanAppData = collectOrphanCustomAppData();
+  stats.push(makeStat("orphan_app_data", orphanAppData.bytes, orphanAppData.keys.length));
 
   onProgress?.("扫描残留媒体（全库引用检查，需要一点时间）…");
   const orphans = await collectOrphanMedia().catch(() => []);
@@ -508,6 +572,39 @@ async function clearOrphanMedia(): Promise<StorageClearResult> {
   return { cleared, freedBytes };
 }
 
+async function clearPhotoWallImages(keepDays?: number): Promise<StorageClearResult> {
+  const state = loadPhotoWallState();
+  const cutoff = cutoffMs(keepDays);
+  const keep: typeof state.photos = [];
+  const removed: typeof state.photos = [];
+  let freedBytes = 0;
+  const summaries = await listMediaCacheSummaries().catch(() => []);
+  const bytesById = new Map(summaries.map(item => [item.id, item.bytes] as const));
+  for (const photo of state.photos) {
+    if (!isBeforeCutoff(photo.createdAt, cutoff)) {
+      keep.push(photo);
+      continue;
+    }
+    removed.push(photo);
+    const id = photo.mediaRef.startsWith(MEDIA_STORE_PROTOCOL) ? photo.mediaRef.slice(MEDIA_STORE_PROTOCOL.length) : "";
+    freedBytes += bytesById.get(id) ?? 0;
+  }
+  if (removed.length) savePhotoWallState({ ...state, photos: keep });
+  // Metadata is removed first, then references are scanned again. Delete only blobs
+  // no longer referenced by any remaining feature; shared chat/theme refs are preserved.
+  const uniqueRefs = Array.from(new Set(removed.map(photo => photo.mediaRef).filter(isMediaStoreRef)));
+  for (const ref of uniqueRefs) {
+    const id = ref.slice(MEDIA_STORE_PROTOCOL.length);
+    let stillReferenced = false;
+    await scanAllStorageStrings(raw => {
+      if (raw.includes(id)) stillReferenced = true;
+    }, [MEDIA_CACHE_DB]);
+    if (!stillReferenced) await deleteMediaRef(ref).catch(() => undefined);
+    else freedBytes -= bytesById.get(id) ?? 0;
+  }
+  return { cleared: removed.length, freedBytes: Math.max(0, freedBytes) };
+}
+
 export async function clearStorageCategory(
   id: StorageCategoryId,
   options: { keepDays?: number } = {},
@@ -516,6 +613,7 @@ export async function clearStorageCategory(
     case "chat_images": return clearChatCategory("image", options.keepDays);
     case "chat_voice": return clearChatCategory("voice", options.keepDays);
     case "chat_media_files": return clearChatCategory("file", options.keepDays);
+    case "photo_wall_images": return clearPhotoWallImages(options.keepDays);
     case "moments_images": return clearMomentsImages(options.keepDays);
     case "xiaohongshu_images": return clearXiaohongshuImages(options.keepDays);
     case "local_music": return clearLocalMusic(options.keepDays);
@@ -525,6 +623,11 @@ export async function clearStorageCategory(
       return { cleared: result.deletedAssets, freedBytes: result.freedBytes };
     }
     case "reading_raw_files": return clearReadingRawFiles();
+    case "orphan_app_data": {
+      const orphan = collectOrphanCustomAppData();
+      for (const key of orphan.keys) kvRemove(key);
+      return { cleared: orphan.keys.length, freedBytes: orphan.bytes };
+    }
     case "orphan_media": return clearOrphanMedia();
   }
 }

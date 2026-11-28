@@ -9,8 +9,10 @@
 //     原来的实现就是这个毛病：pollDueCheckIns 写好了，却谁也
 //     没调用它，于是「手动试一次」能弹、到点一次都不弹。
 //
-//  ② 「用户自己点悬浮球截屏」的结果由 ShellPushRegistrar 统一接收，
-//     与查岗轮询分开，避免同一原生事件被多个监听器重复消费。
+//  ② 「用户自己点悬浮球截屏」的结果也要有人来取（startUserShotBridge）。
+//     点球那一刻网页十有八九已被系统回收，事件是丢的，只能靠一个
+//     常驻的接收端在回到前台时把图捞回来。这条链路**不依赖查岗开关**，
+//     只要用户用了悬浮球就该收得到，所以与下面的定时扫描分开处理。
 //
 // 挂载点与 RealityBridgeScheduler / WidgetScheduler 完全一致。
 
@@ -24,6 +26,7 @@ import {
   pollDueCheckIns,
   prepareCheckInService,
   readCheckInDiagnostics,
+  startUserShotBridge,
 } from "@/lib/screenshot";
 
 /** 扫描间隔。查岗的节奏本身就按分钟算（最短 5 分钟），一分钟扫一遍足够细，
@@ -36,6 +39,10 @@ const FIRST_SCAN_DELAY_MS = 5_000;
 
 export function CheckInScheduler() {
   useEffect(() => {
+    // 主动截屏接收端：挂载时补收一张，之后每次收到 checkIn 事件再拉一次。
+    // 原生侧是「读到即空」，重复调用不会把同一张图发两遍。
+    const stopUserShotBridge = startUserShotBridge();
+
     let cancelTimer: (() => void) | null = null;
     let disposed = false;
 
@@ -82,21 +89,24 @@ export function CheckInScheduler() {
       schedule();
     }, FIRST_SCAN_DELAY_MS);
 
-    // 回到前台立刻补一次：后台期间定时器被冻结，该触发的那几次就靠这一刻补上。
-    // 与查岗「不做隐蔽触发」的约定不冲突——这里只是把已经到点的补上，
-    // 每一次仍然会弹浮层让用户当场决定。
+    // 回到前台立刻补扫：只用于更新状态与处理「不限制前后台」模式；
+    // 「仅后台」模式会由原生生命周期门禁拒绝在前台补发，避免退出 App 后回来反而弹窗。
     const onResume = () => { void scan(); };
     const onVisible = () => { if (document.visibilityState === "visible") void scan(); };
+    const onConfigChange = () => { void scan(); };
     window.addEventListener("focus", onResume);
     window.addEventListener("pageshow", onResume);
+    window.addEventListener("check-in-config-changed", onConfigChange);
     document.addEventListener("visibilitychange", onVisible);
 
     return () => {
       disposed = true;
       cancelFirstScan();
       if (cancelTimer) cancelTimer();
+      stopUserShotBridge();
       window.removeEventListener("focus", onResume);
       window.removeEventListener("pageshow", onResume);
+      window.removeEventListener("check-in-config-changed", onConfigChange);
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, []);

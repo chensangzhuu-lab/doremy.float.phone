@@ -30,6 +30,11 @@ export type PushMessage = {
   type?: "shortcut_command";
   commandId?: string;
   ttl?: number;
+  kind?: string;
+  sessionId?: string;
+  sceneId?: string;
+  characterName?: string;
+  avatar?: string;
 };
 
 export type PushSendResult = {
@@ -48,7 +53,16 @@ export type ShellBroadcastResult = { ok: boolean; status?: number; detail?: stri
 /** 向安卓壳的个人频道 shellpush:<userId> 广播一条通知（尽力而为）。 */
 export async function broadcastShellNotifyWithDetail(
   userId: string,
-  message: { title: string; body: string; url?: string },
+  message: {
+    title: string;
+    body: string;
+    url?: string;
+    kind?: string;
+    sessionId?: string;
+    sceneId?: string;
+    characterName?: string;
+    avatar?: string;
+  },
 ): Promise<ShellBroadcastResult> {
   const config = getSupabaseServerConfig();
   if (!config) return { ok: false, detail: "站点未配置 SUPABASE_SERVICE_ROLE_KEY，无法广播" };
@@ -64,15 +78,21 @@ export async function broadcastShellNotifyWithDetail(
         messages: [{
           topic: `shellpush:${userId}`,
           event: "notify",
-          payload: { title: message.title, body: message.body, url: message.url || "/" },
+          payload: {
+            title: message.title,
+            body: message.body,
+            url: message.url || "/",
+            kind: message.kind,
+            sessionId: message.sessionId,
+            sceneId: message.sceneId,
+            characterName: message.characterName,
+            avatar: message.avatar,
+          },
         }],
       }),
       cache: "no-store",
     });
     const text = await response.text().catch(() => "");
-    // Realtime 广播接口对「未启用广播」等情况会返回 4xx 并带一句原因。
-    // 过去这里把响应体直接丢掉、只回一个布尔，于是站点测试接口永远只能报
-    // 「shell broadcast failed」，用户完全不知道该去 Supabase 面板开什么。
     return {
       ok: response.ok,
       status: response.status,
@@ -85,7 +105,7 @@ export async function broadcastShellNotifyWithDetail(
 
 export async function broadcastShellNotify(
   userId: string,
-  message: { title: string; body: string; url?: string },
+  message: { title: string; body: string; url?: string; kind?: string; sessionId?: string; sceneId?: string; characterName?: string; avatar?: string },
 ): Promise<boolean> {
   return (await broadcastShellNotifyWithDetail(userId, message)).ok;
 }
@@ -106,7 +126,6 @@ export async function getOrCreateVapidConfig(): Promise<VapidKeys> {
   const existing = await supabaseRestFetch<VapidConfigRow[]>(select);
   if (!existing.ok) throw new Error(existing.error);
   if (existing.data[0]) {
-    // 老行补齐 cron_secret / payload_key
     const patch: Record<string, string> = {};
     if (!existing.data[0].cron_secret) patch.cron_secret = randomBytes(24).toString("hex");
     if (!existing.data[0].payload_key) patch.payload_key = randomBytes(32).toString("hex");
@@ -133,7 +152,6 @@ export async function getOrCreateVapidConfig(): Promise<VapidKeys> {
   });
   if (!insert.ok) throw new Error(insert.error);
 
-  // 并发自举时可能有另一实例先写入——以表里的最终行为准。
   const again = await supabaseRestFetch<VapidConfigRow[]>(select);
   if (!again.ok) throw new Error(again.error);
   if (again.data[0]) {
@@ -149,7 +167,6 @@ export async function getOrCreatePushPayloadKey(): Promise<string> {
   const existing = await supabaseRestFetch<{ payload_key?: string | null }[]>(select);
   if (!existing.ok) throw new Error(existing.error);
   if (existing.data[0]?.payload_key) return existing.data[0].payload_key;
-  // 行不存在或列为空：走 VAPID 自举顺带补齐，再读一次
   await getOrCreateVapidConfig();
   const again = await supabaseRestFetch<{ payload_key?: string | null }[]>(select);
   if (!again.ok) throw new Error(again.error);
@@ -175,7 +192,6 @@ export async function sendPushToUser(
       try {
         return new URL(message.url, subject.startsWith("https://") ? subject : undefined).toString();
       } catch {
-        // Keep the supplied value for legacy service-worker handling.
         return message.url;
       }
     }
@@ -188,10 +204,6 @@ export async function sendPushToUser(
       return "";
     }
   })();
-  // Declarative Web Push lets current Safari navigate notifications without
-  // relying on WebKit's inconsistent notificationclick/openWindow handling.
-  // Older browsers receive the same JSON in the service worker, which parses
-  // this shape and displays an imperative fallback notification.
   const payload = JSON.stringify({
     web_push: 8030,
     notification: {
@@ -207,6 +219,11 @@ export async function sendPushToUser(
         url: navigate,
         type: message.type || "",
         commandId: message.commandId || "",
+        kind: message.kind || "",
+        sessionId: message.sessionId || "",
+        sceneId: message.sceneId || "",
+        characterName: message.characterName || "",
+        avatar: message.avatar || "",
       },
     },
   });
@@ -215,7 +232,16 @@ export async function sendPushToUser(
   const shellSubs = subs.data.filter(sub => sub.endpoint.startsWith(SHELL_ENDPOINT_PREFIX));
   const webSubs = subs.data.filter(sub => !sub.endpoint.startsWith(SHELL_ENDPOINT_PREFIX));
   if (shellSubs.length > 0) {
-    const broadcast = await broadcastShellNotifyWithDetail(userId, { title: message.title, body: message.body, url: navigate });
+    const broadcast = await broadcastShellNotifyWithDetail(userId, {
+      title: message.title,
+      body: message.body,
+      url: navigate,
+      kind: message.kind,
+      sessionId: message.sessionId,
+      sceneId: message.sceneId,
+      characterName: message.characterName,
+      avatar: message.avatar,
+    });
     if (broadcast.ok) result.sent += shellSubs.length;
     else result.errors.push(`shell broadcast failed: ${broadcast.detail || "unknown"}`);
   }
@@ -241,7 +267,6 @@ export async function sendPushToUser(
         ? Number((err as { statusCode?: unknown }).statusCode)
         : 0;
       if (statusCode === 404 || statusCode === 410) {
-        // 订阅已在系统侧失效（用户删了 PWA / 撤销授权）——清掉这行。
         await supabaseRestFetch(endpointFilter, { method: "DELETE" }).catch(() => undefined);
       } else {
         result.errors.push(err instanceof Error ? err.message : String(err));

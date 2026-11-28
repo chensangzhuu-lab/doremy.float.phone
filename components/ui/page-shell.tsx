@@ -1,6 +1,6 @@
 "use client";
 
-import type { ReactNode, Ref } from "react";
+import { useEffect, type CSSProperties, type ReactNode, type Ref } from "react";
 import { ChevronLeft } from "lucide-react";
 
 type PageShellProps = {
@@ -11,13 +11,26 @@ type PageShellProps = {
   children: ReactNode;
   footer?: ReactNode;
   className?: string;
+  headerClassName?: string;
+  headerStyle?: CSSProperties;
   bodyRef?: Ref<HTMLDivElement>;
 };
 
-export function PageShell({ title = "", onBack, leftAction, rightAction, children, footer, className, bodyRef }: PageShellProps) {
+export function PageShell({ title = "", onBack, leftAction, rightAction, children, footer, className, headerClassName, headerStyle, bodyRef }: PageShellProps) {
+  useEffect(() => {
+    if (!onBack) return;
+    const handleSwipeBack = (event: Event) => {
+      if (event.defaultPrevented) return;
+      event.preventDefault();
+      onBack();
+    };
+    document.addEventListener("phone-swipe-back", handleSwipeBack);
+    return () => document.removeEventListener("phone-swipe-back", handleSwipeBack);
+  }, [onBack]);
+
   return (
     <div className={`page-shell ${className ?? ""}`}>
-      <header className="page-header" data-ui="header">
+      <header className={`page-header ${headerClassName ?? ""}`.trim()} style={headerStyle} data-ui="header">
         <div className="page-header-safe-area" />
         <div className="page-header-content">
           {onBack ? (
@@ -54,6 +67,16 @@ type PageOverlayHeaderProps = {
 };
 
 export function PageOverlayHeader({ title, onBack, rightAction, className }: PageOverlayHeaderProps) {
+  useEffect(() => {
+    const handleSwipeBack = (event: Event) => {
+      if (event.defaultPrevented) return;
+      event.preventDefault();
+      onBack();
+    };
+    document.addEventListener("phone-swipe-back", handleSwipeBack);
+    return () => document.removeEventListener("phone-swipe-back", handleSwipeBack);
+  }, [onBack]);
+
   return (
     <header className={`page-header pointer-events-none absolute top-0 left-0 right-0 z-10 ${className ?? ""}`}>
       <div className="page-header-safe-area" />

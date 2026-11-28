@@ -23,7 +23,16 @@ export type WorldBookEntry = {
     insertion_order: number;
 };
 
+export type WorldBookFolder = {
+    id: string;
+    name: string;
+    createdAt: number;
+    updatedAt: number;
+};
+
 export type WorldBookConfig = SettingItemMeta & {
+    /** 所属文件夹 ID。缺省（或引用了已不存在的文件夹）表示根目录，兼容旧数据。 */
+    folderId?: string;
     entries: WorldBookEntry[];
 };
 
@@ -171,6 +180,18 @@ export type VoiceApiConfig = {
     speechSpeed?: number;
     /** Minimax voice_setting.pitch（半音，±12）。缺省保持旧行为（0，原声）。 */
     speechPitch?: number;
+    /** ElevenLabs voice_settings.stability (0-1). */
+    stability?: number;
+    /** ElevenLabs voice_settings.similarity_boost (0-1). */
+    similarityBoost?: number;
+    /** ElevenLabs voice_settings.style (0-1). */
+    style?: number;
+    /** ElevenLabs voice_settings.use_speaker_boost. */
+    speakerBoost?: boolean;
+    /** 输出格式：mp3 / wav / pcm16 等，按 provider 支持能力。 */
+    outputFormat?: string;
+    /** 风格/导演指令：MiMo user message、OpenAI instructions 等。 */
+    instructions?: string;
     customVoices?: { id: string; name: string; createdAt?: number }[];
     enableSTT: boolean;
     enableTTS: boolean;
@@ -238,6 +259,8 @@ export type ImageGenerationSettings = {
     size: string;
     quality: string;
     extraPrompt: string;
+    /** 身份参考图发送模式：多图（推荐）/ 拼图（兼容单图服务）/ 仅当前角色。 */
+    referenceImageMode?: "multi" | "collage" | "current";
     openaiPresets?: OpenAiImagePreset[];
     activeOpenAiPresetId?: string;
     // NovelAI 模式配置
@@ -270,13 +293,13 @@ export type ContentAppId =
     | "chat" | "diary" | "music" | "reading"
     | "forum" | "cocreate" | "story" | "game" | "xiaohongshu" | "dwelling"
     | "checkphone" | "shopping" | "calendar" | "interview_magazine"
-    | "moments" | "group_chat" | "vn" | "adventure";
+    | "moments" | "group_chat" | "vn" | "adventure" | "memo";
 
 export const CONTENT_APP_IDS: ContentAppId[] = [
     "chat", "diary", "music", "reading",
     "cocreate", "story", "game", "xiaohongshu", "dwelling",
     "checkphone", "shopping", "calendar", "interview_magazine",
-    "moments", "group_chat", "vn", "adventure"
+    "moments", "group_chat", "vn", "adventure", "memo"
 ];
 
 export const CONTENT_APP_LABELS: Record<ContentAppId, string> = {
@@ -298,6 +321,7 @@ export const CONTENT_APP_LABELS: Record<ContentAppId, string> = {
     group_chat: "群聊",
     vn: "漫卷",
     adventure: "冒险",
+    memo: "备忘录",
 };
 
 // Binding slot — config selections for a given scope

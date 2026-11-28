@@ -3,6 +3,7 @@ import type {
     PresetConfig,
     WorldBookConfig,
     WorldBookEntry,
+    WorldBookFolder,
     RegexConfig,
     RegexRule,
     ApiConfig,
@@ -17,6 +18,7 @@ import type {
 } from "./settings-types";
 import type { UserIdentity } from "@/components/settings/user-identity";
 import { createBuiltinPreset, BUILTIN_PRESET_VERSION } from "./builtin-preset";
+import { createBuiltinAppPrompts } from "./builtin-app-prompts";
 import {
     NOVELAI_DEFAULT_MODEL,
     NOVELAI_DEFAULT_NOISE_SCHEDULE,
@@ -36,6 +38,7 @@ import {
     readPresetsCache, writePresetsCache,
     writePresetsCacheAsync,
     readWorldBooksCache, writeWorldBooksCache,
+    readWorldBookFoldersCache, writeWorldBookFoldersCache,
     readRegexesCache, writeRegexesCache,
     hydrateSettingsDb,
 } from "./settings-db";
@@ -176,6 +179,42 @@ function preserveCustomAppPresetPrompts(fresh: PresetConfig, previous: PresetCon
     };
 }
 
+/**
+ * 内置 APP 的提示词条目按需补齐：只追加缺失项并插入到 shortTermMemory 之前，
+ * 不覆盖用户已修改的内容，也不升 BUILTIN_PRESET_VERSION（升版本会冲掉用户自定义）。
+ */
+function mergeMissingBuiltinAppPrompts(existing: PresetConfig): PresetConfig {
+    const freshPrompts = createBuiltinAppPrompts();
+    /* 先按 identifier / 名称去重：历史版本可能把同一条内置条目写了两份 */
+    const seenId = new Set<string>();
+    const seenName = new Set<string>();
+    const dedupedPrompts = (existing.prompts ?? []).filter((prompt) => {
+        const key = String(prompt.identifier || "");
+        const nameKey = String(prompt.name || "").trim();
+        if (key && seenId.has(key)) return false;
+        if (nameKey && seenName.has(nameKey)) return false;
+        if (key) seenId.add(key);
+        if (nameKey) seenName.add(nameKey);
+        return true;
+    });
+    if (dedupedPrompts.length !== (existing.prompts ?? []).length) {
+        existing = { ...existing, prompts: dedupedPrompts };
+    }
+    const existingIds = new Set(dedupedPrompts.map(prompt => prompt.identifier));
+    const missing = freshPrompts.filter(prompt => !existingIds.has(prompt.identifier));
+    if (missing.length === 0) return existing;
+
+    const order = [...(existing.prompt_order ?? [])];
+    let cursor = order.findIndex(entry => entry.identifier === "shortTermMemory" || entry.identifier === "chatHistory");
+    if (cursor < 0) cursor = order.length;
+    for (const prompt of missing) {
+        if (order.some(entry => entry.identifier === prompt.identifier)) continue;
+        order.splice(cursor, 0, { identifier: prompt.identifier, enabled: true });
+        cursor += 1;
+    }
+    return { ...existing, prompts: [...(existing.prompts ?? []), ...missing], prompt_order: order };
+}
+
 
 // --- Presets ──────────────────────────────────────────
 
@@ -193,15 +232,65 @@ export function loadPresets(): PresetConfig[] {
             presets.unshift(builtin);
             savePresets(presets);
             shouldPersistCleanup = false;
-        } else if ((existingBuiltin.builtInVersion ?? 0) < BUILTIN_PRESET_VERSION) {
+        } else {
+            /* 内置副本的定向迁移：只修「专注陪伴」条目的作用域/名称/顺序，
+               不动用户改过的内容，也不需要升版本号（升版本会重写出厂内容）。 */
+            const focusEntry = (existingBuiltin.prompts ?? []).find(p => p.identifier === "focus_companion_proactive");
+            if (focusEntry && (focusEntry.tags ?? []).length === 0) {
+                focusEntry.tags = ["chat", "text"];
+                focusEntry.name = "◇ 专注陪伴·主动推进";
+                const order = [...(existingBuiltin.prompt_order ?? [])];
+                const idx = order.findIndex(o => o.identifier === "focus_companion_proactive");
+                const toolsIdx = order.findIndex(o => o.identifier === "chat_tools");
+                if (idx >= 0 && toolsIdx >= 0 && idx !== toolsIdx - 1) {
+                    const [entry] = order.splice(idx, 1);
+                    const newToolsIdx = order.findIndex(o => o.identifier === "chat_tools");
+                    order.splice(newToolsIdx >= 0 ? newToolsIdx : order.length, 0, entry);
+                    existingBuiltin.prompt_order = order;
+                }
+                savePresets(presets);
+                shouldPersistCleanup = false;
+            }
+            if ((existingBuiltin.builtInVersion ?? 0) < BUILTIN_PRESET_VERSION) {
             const fresh = preserveCustomAppPresetPrompts(createBuiltinPreset(), existingBuiltin);
             fresh.id = existingBuiltin.id;
             const idx = presets.indexOf(existingBuiltin);
             presets[idx] = fresh;
             savePresets(presets);
             shouldPersistCleanup = false;
-        } else if (shouldPersistCleanup) {
-            savePresets(presets);
+            } else if (shouldPersistCleanup) {
+                savePresets(presets);
+            }
+        }
+
+        /* 归一化：清掉历史遗留的「专注陪伴」重复条目（旧名含「角色陪伴专注」），
+           并把保留的那条统一成新名称与线上聊天作用域。 */
+        let normalizedAny = false;
+        for (const preset of presets) {
+            const prompts = preset.prompts ?? [];
+            const focus = prompts.find(p => p.identifier === "focus_companion_proactive");
+            const legacy = prompts.find(p => p.identifier !== "focus_companion_proactive" && String(p.name || "").indexOf("角色陪伴专注") >= 0);
+            if (legacy) {
+                const legacyId = legacy.identifier;
+                preset.prompts = prompts.filter(p => p.identifier !== legacyId);
+                preset.prompt_order = (preset.prompt_order ?? []).filter(o => o.identifier !== legacyId);
+                normalizedAny = true;
+            }
+            if (focus) {
+                if ((focus.tags ?? []).length === 0) { focus.tags = ["chat", "text"]; normalizedAny = true; }
+                if (String(focus.name || "").indexOf("专注陪伴") < 0) { focus.name = "◇ 专注陪伴·主动推进"; normalizedAny = true; }
+            }
+        }
+        if (normalizedAny) savePresets(presets);
+
+        // 内置 APP 的提示词条目按需补齐（只追加缺失项，保留用户已改内容）。
+        const builtinPreset = presets.find(p => p.builtIn);
+        if (builtinPreset) {
+            const merged = mergeMissingBuiltinAppPrompts(builtinPreset);
+            if (merged !== builtinPreset) {
+                presets[presets.indexOf(builtinPreset)] = merged;
+                savePresets(presets);
+            }
         }
 
         return presets;
@@ -420,7 +509,27 @@ export function saveWorldBooks(books: WorldBookConfig[]): void {
     writeWorldBooksCache(books);
 }
 
-export function createWorldBook(name: string): WorldBookConfig {
+export function loadWorldBookFolders(): WorldBookFolder[] {
+    if (typeof window === "undefined") return [];
+    return [...readWorldBookFoldersCache()];
+}
+
+export function saveWorldBookFolders(folders: WorldBookFolder[]): void {
+    if (typeof window === "undefined") return;
+    writeWorldBookFoldersCache(folders);
+}
+
+export function createWorldBookFolder(name: string): WorldBookFolder {
+    const now = getNow();
+    return {
+        id: generateId("wb-folder"),
+        name,
+        createdAt: now,
+        updatedAt: now,
+    };
+}
+
+export function createWorldBook(name: string, folderId?: string): WorldBookConfig {
     const now = getNow();
     return {
         id: generateId("wb"),
@@ -428,6 +537,7 @@ export function createWorldBook(name: string): WorldBookConfig {
         description: "",
         createdAt: now,
         updatedAt: now,
+        ...(folderId ? { folderId } : {}),
         entries: []
     };
 }
@@ -468,6 +578,10 @@ export function parseWorldBookFromJson(text: string): WorldBookConfig | null {
         if (isUnsupportedWorldBookFormat(obj)) throw new Error(UNSUPPORTED_IMPORT_FORMAT);
 
         const wb = createWorldBook(obj.name || "导入的世界书");
+        // 导出时 folderId 随整个对象写出；旧 JSON 没有该字段 => 根目录。
+        if (typeof obj.folderId === "string" && obj.folderId.trim()) {
+            wb.folderId = obj.folderId.trim();
+        }
         if (Array.isArray(obj.entries)) {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const parsedEntries = obj.entries.map((e: any) => parseWorldBookEntry(e));
@@ -694,6 +808,7 @@ export const DEFAULT_IMAGE_GENERATION_SETTINGS: ImageGenerationSettings = {
     size: "1024x1024",
     quality: "auto",
     extraPrompt: "",
+    referenceImageMode: "multi",
     novelai: {
         apiKey: "",
         requestMode: "direct",
@@ -749,6 +864,7 @@ function normalizeImageGenerationSettings(settings: Partial<ImageGenerationSetti
         : {};
     const refs: ImageGenerationSettings["characterReferences"] = {};
     for (const [characterId, rawRef] of Object.entries(rawRefs)) {
+        if (characterId === "__group__") continue;
         if (!rawRef || typeof rawRef !== "object") continue;
         const crop = rawRef.faceCrop;
         const size = crop && typeof crop.size === "number" ? Math.max(0.18, Math.min(1, crop.size)) : 0.46;
@@ -803,7 +919,7 @@ function normalizeImageGenerationSettings(settings: Partial<ImageGenerationSetti
     const activeOpenAiPreset = openaiPresets.find(preset => preset.id === activeOpenAiPresetId) || openaiPresets[0];
 
     const rawNai = settings?.novelai;
-    let naiPresets = Array.isArray(rawNai?.presets) && rawNai.presets.length > 0
+    const naiPresets = Array.isArray(rawNai?.presets) && rawNai.presets.length > 0
         ? rawNai.presets.map((p, idx) => normalizeNovelAiPreset(p, idx))
         : [DEFAULT_NOVELAI_PRESET];
     let activePresetId = typeof rawNai?.activePresetId === "string" ? rawNai.activePresetId : naiPresets[0].id;

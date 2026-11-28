@@ -43,6 +43,18 @@ export async function synthesizeSpeech(
         return synthesizeOpenAI(text, voiceConfig);
     }
 
+    if (provider === "ElevenLabs") {
+        return synthesizeElevenLabs(text, voiceConfig);
+    }
+
+    if (provider === "FishAudio") {
+        return synthesizeFishAudio(text, voiceConfig);
+    }
+
+    if (provider === "MiMo") {
+        return synthesizeMiMo(text, voiceConfig);
+    }
+
     return null;
 }
 
@@ -177,6 +189,91 @@ async function synthesizeOpenAI(text: string, config: VoiceApiConfig): Promise<B
     return new Blob([await blob.arrayBuffer()], { type: "audio/mpeg" });
 }
 
+// ── ElevenLabs TTS ──────────────────────────────────
+async function synthesizeElevenLabs(text: string, config: VoiceApiConfig): Promise<Blob | null> {
+    if (!config.apiKey) throw new Error("ElevenLabs API Key 未配置");
+    const baseUrl = (config.baseUrl || "https://api.elevenlabs.io").replace(/\/$/, "");
+    const voiceId = (config.defaultVoice || "21m00Tcm4TlvDq8ikWAM").trim();
+    const modelId = config.model || "eleven_multilingual_v2";
+    const body: Record<string, unknown> = {
+        text,
+        model_id: modelId,
+        voice_settings: {
+            stability: typeof config.stability === "number" ? config.stability : 0.5,
+            similarity_boost: typeof config.similarityBoost === "number" ? config.similarityBoost : 0.75,
+            style: typeof config.style === "number" ? config.style : 0,
+            use_speaker_boost: config.speakerBoost !== false,
+        },
+    };
+    if (typeof config.speechSpeed === "number" && Number.isFinite(config.speechSpeed)) body.speed = config.speechSpeed;
+    const response = await fetchWithTimeout(`${baseUrl}/v1/text-to-speech/${encodeURIComponent(voiceId)}`, {
+        method: "POST",
+        headers: { "xi-api-key": config.apiKey, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+        const errText = await response.text().catch(() => "");
+        throw new Error(`ElevenLabs TTS 请求失败 (${response.status}): ${errText.slice(0, 200)}`);
+    }
+    return new Blob([await response.arrayBuffer()], { type: "audio/mpeg" });
+}
+
+// ── Fish Audio TTS ──────────────────────────────────
+async function synthesizeFishAudio(text: string, config: VoiceApiConfig): Promise<Blob | null> {
+    if (!config.apiKey) throw new Error("Fish Audio API Key 未配置");
+    // 浏览器直连 Fish 会撞 CORS；走本站同源代理，目标域名固定在 route 内。
+    const response = await fetchWithTimeout("/api/voice/fish-audio-tts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            apiKey: config.apiKey,
+            text,
+            format: config.outputFormat || "mp3",
+            voiceId: config.defaultVoice || "",
+            ...(typeof config.speechSpeed === "number" ? { speed: config.speechSpeed } : {}),
+        }),
+    });
+    if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(`Fish Audio TTS 请求失败 (${response.status}): ${String(err.message || err.error || "").slice(0, 200)}`);
+    }
+    return new Blob([await response.arrayBuffer()], { type: "audio/mpeg" });
+}
+
+// ── Xiaomi MiMo TTS (Chat Completions compatible) ─────
+async function synthesizeMiMo(text: string, config: VoiceApiConfig): Promise<Blob | null> {
+    if (!config.apiKey) throw new Error("MiMo API Key 未配置");
+    const baseUrl = (config.baseUrl || "https://api.xiaomimimo.com/v1").replace(/\/$/, "");
+    const format = config.outputFormat || "wav";
+    const response = await fetchWithTimeout(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { "api-key": config.apiKey, Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+            model: config.model || "mimo-v2.5-tts",
+            messages: [
+                { role: "user", content: config.instructions || "自然、贴合角色，语速适中" },
+                { role: "assistant", content: text },
+            ],
+            audio: { voice: config.defaultVoice || "冰糖", format },
+        }),
+    });
+    if (!response.ok) {
+        const errText = await response.text().catch(() => "");
+        throw new Error(`MiMo TTS 请求失败 (${response.status}): ${errText.slice(0, 200)}`);
+    }
+    const data = await response.json().catch(() => ({}));
+    const raw = data.choices?.[0]?.message?.audio?.data;
+    if (typeof raw !== "string" || !raw) throw new Error("MiMo 没有返回音频数据");
+    return base64ToBlob(raw, format === "mp3" ? "audio/mpeg" : "audio/wav");
+}
+
+function base64ToBlob(raw: string, contentType: string): Blob {
+    const binary = atob(raw);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new Blob([bytes], { type: contentType });
+}
+
 // ── iOS audio playback that coexists with speech recognition ──────────
 // On iOS Safari, playing TTS through an <audio> element keeps the system audio
 // session in "playback" mode, which steals the mic from webkitSpeechRecognition
@@ -185,6 +282,8 @@ async function synthesizeOpenAI(text: string, config: VoiceApiConfig): Promise<B
 // AudioContext and explicitly suspend() it after each clip so iOS hands the
 // audio session back to the microphone. A shared <audio> element is kept as a
 // fallback for browsers without AudioContext.
+
+type AudioContextWindow = typeof globalThis & { webkitAudioContext?: typeof AudioContext };
 
 let _audioCtx: AudioContext | null = null;
 let _sharedAudio: HTMLAudioElement | null = null;
@@ -223,6 +322,34 @@ export function setTtsVolume(volume: number): void {
 // 上下文永久 resume，页面从第一次点击起就一直持有系统音频会话；叠加通话退出
 // 后识别泄漏，整页音频会被钉在"通话模式"（语音条/试听音量巨大且音量键失灵）。
 let _callAudioSessionActive = false;
+let _callAudioFocusUsers = 0;
+
+type CallAudioFocusBridge = {
+    requestCallAudioFocus?: () => boolean;
+    abandonCallAudioFocus?: () => boolean;
+};
+
+/** 仅在通话 TTS 真正播放时借用原生临时焦点；普通网页/旧版 APK 自动降级。 */
+function acquireCallAudioFocus(): boolean {
+    if (!_callAudioSessionActive || typeof window === "undefined") return false;
+    const bridge = (window as unknown as { AndroidShell?: CallAudioFocusBridge }).AndroidShell;
+    if (!bridge?.requestCallAudioFocus || !bridge.abandonCallAudioFocus) return false;
+    if (_callAudioFocusUsers === 0) {
+        try {
+            if (bridge.requestCallAudioFocus() !== true) return false;
+        } catch { return false; }
+    }
+    _callAudioFocusUsers += 1;
+    return true;
+}
+
+function releaseCallAudioFocus(held: boolean): void {
+    if (!held) return;
+    _callAudioFocusUsers = Math.max(0, _callAudioFocusUsers - 1);
+    if (_callAudioFocusUsers !== 0 || typeof window === "undefined") return;
+    const bridge = (window as unknown as { AndroidShell?: CallAudioFocusBridge }).AndroidShell;
+    try { bridge?.abandonCallAudioFocus?.(); } catch { /* 原生壳退出/旧版本时忽略 */ }
+}
 
 /** 通话界面挂载时置 true、卸载/挂断时置 false（false 时立即挂起空闲的上下文）。 */
 export function setCallAudioSessionActive(active: boolean): void {
@@ -234,7 +361,8 @@ export function setCallAudioSessionActive(active: boolean): void {
 
 function getAudioContext(): AudioContext | null {
     if (typeof window === "undefined") return null;
-    const Ctor = (window as any).AudioContext || (window as any).webkitAudioContext;
+    const audioWindow = window as unknown as AudioContextWindow;
+    const Ctor = audioWindow.AudioContext || audioWindow.webkitAudioContext;
     if (!Ctor) return null;
     if (!_audioCtx) {
         // 不要钉 sampleRate:部分 iOS 版本上非硬件采样率的 ctx 会"时钟照走、
@@ -356,6 +484,7 @@ export function playAudioBlobViaMediaElement(blob: Blob): { promise: Promise<voi
 }
 
 function playAudioBlobElement(blob: Blob): { promise: Promise<void>; abort: () => void } {
+    const callAudioFocusHeld = acquireCallAudioFocus();
     const url = URL.createObjectURL(blob);
     const audio = getSharedAudio();
     audio.muted = false;
@@ -378,6 +507,7 @@ function playAudioBlobElement(blob: Blob): { promise: Promise<void>; abort: () =
         audio.onloadedmetadata = null;
         URL.revokeObjectURL(url);
         try { audio.pause(); audio.removeAttribute("src"); audio.load(); } catch {}
+        releaseCallAudioFocus(callAudioFocusHeld);
         resolveFn();
     };
     // 播放被别的 App（如后台刷视频）抢走音频焦点时，浏览器只会发一个 pause，
